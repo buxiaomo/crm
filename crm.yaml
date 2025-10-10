@@ -13,7 +13,7 @@ allowed_hosts:
   - "^.*\\.gcr\\.io$"
 
 mitm:
-  enabled: true
+  enabled: false
   ca_cert_path: "./ca.crt"
   ca_key_path: "./ca.key"
 
