@@ -893,7 +893,7 @@ func main() {
 		Handler: logMiddleware(level, handler),
 	}
 
-	log.Printf("crm listening on %s", listenAddr)
+	log.Printf("Container Registry Mirrors listening on %s", listenAddr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
