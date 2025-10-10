@@ -19,10 +19,12 @@ import (
 	"net/http"
 	"net/http/httptrace"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"encoding/json"
@@ -189,14 +191,18 @@ func isAllowedHost(host string, patterns []*regexp.Regexp) bool {
 }
 
 // CertificateAuthority 管理 CA 证书和签发动态证书
+// 用于 MITM 模式下动态生成和缓存 TLS 证书
 type CertificateAuthority struct {
-	caCert     *x509.Certificate
-	caPrivKey  *rsa.PrivateKey
-	certCache  map[string]*tls.Certificate
-	cacheMutex sync.RWMutex
+	caCert     *x509.Certificate           // CA 根证书
+	caPrivKey  *rsa.PrivateKey             // CA 私钥
+	certCache  map[string]*tls.Certificate // 主机名到证书的缓存映射
+	cacheMutex sync.RWMutex                // 保护证书缓存的互斥锁
 }
 
-// 加载 CA 证书和私钥
+// loadCA 从指定路径加载 CA 证书和私钥
+// certPath: CA 证书文件路径
+// keyPath: CA 私钥文件路径
+// 返回初始化的 CertificateAuthority 和可能的错误
 func loadCA(certPath, keyPath string) (*CertificateAuthority, error) {
 	// 读取 CA 证书
 	caCertPEM, err := os.ReadFile(certPath)
@@ -607,6 +613,7 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, req
 	host := r.Host
 	if !isAllowedHost(host, p.allowedPatterns) {
 		http.Error(w, "host not allowed", http.StatusForbidden)
+		log.Printf("[req %s] 拒绝连接到非允许主机: %s", reqID, host)
 		return
 	}
 
@@ -620,32 +627,39 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, req
 	}
 
 	// 标准 CONNECT 处理（透明隧道）
-	// Establish TCP connection to upstream
 	upstream, err := net.DialTimeout("tcp", host, 10*time.Second)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("dial upstream failed: %v", err), http.StatusBadGateway)
+		errMsg := fmt.Sprintf("dial upstream failed: %v", err)
+		http.Error(w, errMsg, http.StatusBadGateway)
+		log.Printf("[req %s] 连接上游失败: %s, 错误: %v", reqID, host, err)
 		return
 	}
+	defer upstream.Close() // 确保连接关闭
 
 	// Hijack client connection
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		upstream.Close()
-		return
-	}
-	clientConn, clientBuf, err := hj.Hijack()
-	if err != nil {
-		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
-		upstream.Close()
+		log.Printf("[req %s] 不支持连接劫持", reqID)
 		return
 	}
 
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
+		log.Printf("[req %s] 连接劫持失败: %v", reqID, err)
+		return
+	}
+	defer clientConn.Close() // 确保连接关闭
+
 	// Send 200 Connection Established
-	_, _ = clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+	if _, err := clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		log.Printf("[req %s] 发送连接建立响应失败: %v", reqID, err)
+		return
+	}
+
 	if err := clientBuf.Flush(); err != nil {
-		clientConn.Close()
-		upstream.Close()
+		log.Printf("[req %s] 刷新缓冲区失败: %v", reqID, err)
 		return
 	}
 
@@ -660,6 +674,7 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, req
 }
 
 // handleMITMConnect 处理 MITM 模式下的 CONNECT 请求
+// 实现中间人模式，解密 HTTPS 流量并转发
 func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request, reqID string, clientAddr string, start time.Time) {
 	host := r.Host
 
@@ -679,19 +694,27 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 	// Hijack client connection
 	hj, ok := w.(http.Hijacker)
 	if !ok {
+		log.Printf("[req %s] 不支持连接劫持", reqID)
 		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
 		return
 	}
+
 	clientConn, clientBuf, err := hj.Hijack()
 	if err != nil {
+		log.Printf("[req %s] 连接劫持失败: %v", reqID, err)
 		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
 		return
 	}
+	defer clientConn.Close() // 确保连接关闭
 
 	// Send 200 Connection Established
-	_, _ = clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+	if _, err := clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
+		log.Printf("[req %s] 发送连接建立响应失败: %v", reqID, err)
+		return
+	}
+
 	if err := clientBuf.Flush(); err != nil {
-		clientConn.Close()
+		log.Printf("[req %s] 刷新缓冲区失败: %v", reqID, err)
 		return
 	}
 
@@ -846,57 +869,97 @@ func tunnelCopy(client net.Conn, upstream net.Conn) (upstreamToClient int64, cli
 }
 
 func main() {
+	// 解析命令行参数
 	var cfgPath string
 	flag.StringVar(&cfgPath, "config", "", "path to config file (yaml/yml/json)")
 	flag.StringVar(&cfgPath, "c", "", "alias of -config")
 	flag.Parse()
 
+	// 加载配置文件
 	var cfg *Config
 	var err error
 	if cfgPath != "" {
 		cfg, err = loadConfigFrom(cfgPath)
+		if err != nil {
+			log.Fatalf("无法从指定路径加载配置: %v", err)
+		}
 	} else {
 		cfg, err = loadConfigAuto()
-	}
-	if err != nil {
-		log.Fatalf("failed to load config: %v", err)
+		if err != nil {
+			log.Fatalf("无法自动加载配置: %v", err)
+		}
 	}
 
+	// 设置日志级别
 	level := resolveLogLevel(cfg)
 	if level >= LevelDebug {
 		log.SetFlags(log.LstdFlags | log.Lshortfile)
+		log.Printf("调试模式已启用")
 	} else {
 		log.SetFlags(log.LstdFlags)
 	}
 
+	// 设置监听地址
 	listenAddr := ":8080"
 	if cfg != nil && cfg.Listen != "" {
 		listenAddr = cfg.Listen
 	}
+	log.Printf("将使用监听地址: %s", listenAddr)
 
+	// 构建允许的主机模式
 	allowed := buildAllowedPatterns(cfg)
+	log.Printf("已配置 %d 个允许的主机模式", len(allowed))
+
+	// 设置 TLS 安全选项
 	insecure := false
 	if cfg != nil {
 		insecure = cfg.InsecureTLS
+		if insecure {
+			log.Printf("警告: 已启用不安全 TLS 模式")
+		}
 	}
 
-	// build display list: defaults + user config
+	// 构建显示列表
 	display := make([]string, 0, len(defaultAllowedHosts))
 	display = append(display, defaultAllowedHosts...)
 	if cfg != nil && len(cfg.AllowedHosts) > 0 {
 		display = append(display, cfg.AllowedHosts...)
 	}
 
+	// 创建代理处理器和服务器
 	handler := newProxyHandler(allowed, display, insecure, level, cfg)
 	srv := &http.Server{
 		Addr:    listenAddr,
 		Handler: logMiddleware(level, handler),
 	}
 
-	log.Printf("Container Registry Mirrors listening on %s", listenAddr)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server error: %v", err)
+	// 设置优雅关闭
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 在单独的 goroutine 中启动服务器
+	go func() {
+		// 启动服务器
+		log.Printf("Container Registry Mirrors 正在监听 %s", listenAddr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("服务器错误: %v", err)
+		}
+	}()
+
+	// 等待中断信号
+	<-ctx.Done()
+	log.Println("收到关闭信号，正在优雅关闭...")
+
+	// 创建关闭超时上下文
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
+
+	// 优雅关闭服务器
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("服务器关闭出错: %v", err)
 	}
+
+	log.Println("服务器已安全关闭")
 }
 
 func logMiddleware(level LogLevel, next http.Handler) http.Handler {
