@@ -1,0 +1,19 @@
+[Unit]
+Description=Container Registry Mirrors
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/crm -config /usr/local/etc/crm.yaml
+ExecReload=/bin/kill -s HUP $MAINPID
+TimeoutSec=0
+RestartSec=2
+Restart=always
+LimitNOFILE=infinity
+LimitNPROC=infinity
+LimitCORE=infinity
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target

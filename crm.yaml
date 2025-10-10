@@ -1,0 +1,14 @@
+listen: ":8888"
+allowed_hosts:
+  - quay.io
+  - mcr.microsoft.com
+  - docker.io
+  - registry-1.docker.io
+  - gcr.io
+  - k8s.io
+  - registry.k8s.io
+  - docker.elastic.co
+  - ghcr.io
+  - "^.*\\.pkg\\.dev$"
+insecure_tls: false
+log_level: info
