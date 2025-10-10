@@ -1,19 +1,27 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptrace"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,10 +42,18 @@ var defaultAllowedHosts = []string{
 }
 
 type Config struct {
-	Listen       string   `yaml:"listen" json:"listen"`
-	AllowedHosts []string `yaml:"allowed_hosts" json:"allowed_hosts"`
-	InsecureTLS  bool     `yaml:"insecure_tls" json:"insecure_tls"`
-	LogLevel     string   `yaml:"log_level" json:"log_level"`
+	Listen       string     `yaml:"listen" json:"listen"`
+	AllowedHosts []string   `yaml:"allowed_hosts" json:"allowed_hosts"`
+	InsecureTLS  bool       `yaml:"insecure_tls" json:"insecure_tls"`
+	LogLevel     string     `yaml:"log_level" json:"log_level"`
+	MITM         MITMConfig `yaml:"mitm" json:"mitm"`
+}
+
+// MITMConfig 控制中间人模式的配置
+type MITMConfig struct {
+	Enabled    bool   `yaml:"enabled" json:"enabled"`           // 是否启用 MITM 模式
+	CACertPath string `yaml:"ca_cert_path" json:"ca_cert_path"` // CA 证书路径
+	CAKeyPath  string `yaml:"ca_key_path" json:"ca_key_path"`   // CA 私钥路径
 }
 
 // LogLevel controls logging granularity
@@ -172,15 +188,140 @@ func isAllowedHost(host string, patterns []*regexp.Regexp) bool {
 	return false
 }
 
+// CertificateAuthority 管理 CA 证书和签发动态证书
+type CertificateAuthority struct {
+	caCert     *x509.Certificate
+	caPrivKey  *rsa.PrivateKey
+	certCache  map[string]*tls.Certificate
+	cacheMutex sync.RWMutex
+}
+
+// 加载 CA 证书和私钥
+func loadCA(certPath, keyPath string) (*CertificateAuthority, error) {
+	// 读取 CA 证书
+	caCertPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 CA 证书失败: %w", err)
+	}
+	caCertBlock, _ := pem.Decode(caCertPEM)
+	if caCertBlock == nil {
+		return nil, fmt.Errorf("解析 CA 证书 PEM 失败")
+	}
+	caCert, err := x509.ParseCertificate(caCertBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("解析 CA 证书失败: %w", err)
+	}
+
+	// 读取 CA 私钥
+	caKeyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取 CA 私钥失败: %w", err)
+	}
+	caKeyBlock, _ := pem.Decode(caKeyPEM)
+	if caKeyBlock == nil {
+		return nil, fmt.Errorf("解析 CA 私钥 PEM 失败")
+	}
+
+	// 尝试解析私钥（支持 PKCS1 和 PKCS8 格式）
+	var caPrivKey *rsa.PrivateKey
+	if caPrivKey, err = x509.ParsePKCS1PrivateKey(caKeyBlock.Bytes); err != nil {
+		// 如果 PKCS1 解析失败，尝试 PKCS8
+		pkcs8Key, err := x509.ParsePKCS8PrivateKey(caKeyBlock.Bytes)
+		if err != nil {
+			return nil, fmt.Errorf("解析 CA 私钥失败: %w", err)
+		}
+
+		// 转换为 RSA 私钥
+		var ok bool
+		caPrivKey, ok = pkcs8Key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, fmt.Errorf("CA 私钥不是 RSA 类型")
+		}
+	}
+
+	return &CertificateAuthority{
+		caCert:    caCert,
+		caPrivKey: caPrivKey,
+		certCache: make(map[string]*tls.Certificate),
+	}, nil
+}
+
+// 为指定域名签发证书
+func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificate, error) {
+	// 检查缓存
+	ca.cacheMutex.RLock()
+	if cert, ok := ca.certCache[hostname]; ok {
+		ca.cacheMutex.RUnlock()
+		return cert, nil
+	}
+	ca.cacheMutex.RUnlock()
+
+	// 生成新证书
+	ca.cacheMutex.Lock()
+	defer ca.cacheMutex.Unlock()
+
+	// 再次检查缓存（避免并发生成）
+	if cert, ok := ca.certCache[hostname]; ok {
+		return cert, nil
+	}
+
+	// 生成私钥
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("生成私钥失败: %w", err)
+	}
+
+	// 准备证书模板
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, fmt.Errorf("生成序列号失败: %w", err)
+	}
+
+	now := time.Now()
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName: hostname,
+		},
+		NotBefore:             now.Add(-10 * time.Minute),
+		NotAfter:              now.Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{hostname},
+	}
+
+	// 使用 CA 签发证书
+	certDER, err := x509.CreateCertificate(rand.Reader, &template, ca.caCert, &privKey.PublicKey, ca.caPrivKey)
+	if err != nil {
+		return nil, fmt.Errorf("签发证书失败: %w", err)
+	}
+
+	// 创建 tls.Certificate
+	cert := &tls.Certificate{
+		Certificate: [][]byte{certDER},
+		PrivateKey:  privKey,
+	}
+
+	// 存入缓存
+	ca.certCache[hostname] = cert
+	return cert, nil
+}
+
 // ProxyHandler implements a simple forward proxy without caching.
 type ProxyHandler struct {
 	allowedPatterns []*regexp.Regexp
 	allowedDisplay  []string
 	transport       *http.Transport
 	level           LogLevel
+
+	// MITM 相关
+	mitmEnabled bool
+	mitmCA      *CertificateAuthority
+	mitmAllowed []*regexp.Regexp
 }
 
-func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS bool, level LogLevel) *ProxyHandler {
+func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS bool, level LogLevel, cfg *Config) *ProxyHandler {
 	tr := &http.Transport{
 		Proxy:                 nil, // do not chain proxies by default
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -192,7 +333,31 @@ func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS boo
 		// No caching; Go's transport does not cache by default.
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS},
 	}
-	return &ProxyHandler{allowedPatterns: allowed, allowedDisplay: display, transport: tr, level: level}
+
+	handler := &ProxyHandler{
+		allowedPatterns: allowed,
+		allowedDisplay:  display,
+		transport:       tr,
+		level:           level,
+		mitmEnabled:     false,
+	}
+
+	// 如果配置了 MITM 模式，加载 CA 证书
+	if cfg != nil && cfg.MITM.Enabled && cfg.MITM.CACertPath != "" && cfg.MITM.CAKeyPath != "" {
+		ca, err := loadCA(cfg.MITM.CACertPath, cfg.MITM.CAKeyPath)
+		if err != nil {
+			log.Printf("MITM 模式初始化失败: %v", err)
+		} else {
+			handler.mitmEnabled = true
+			handler.mitmCA = ca
+
+			// 使用全局允许的主机模式
+			handler.mitmAllowed = allowed
+			log.Printf("MITM 模式已启用，允许 %d 个主机模式", len(allowed))
+		}
+	}
+
+	return handler
 }
 
 var reqSeq uint64
@@ -444,6 +609,17 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, req
 		http.Error(w, "host not allowed", http.StatusForbidden)
 		return
 	}
+
+	// 检查是否启用 MITM 模式且该主机允许 MITM
+	if p.mitmEnabled && p.mitmCA != nil && isAllowedHost(host, p.mitmAllowed) {
+		if p.level >= LevelDebug {
+			log.Printf("[req %s] MITM 模式处理 CONNECT 请求: %s", reqID, host)
+		}
+		p.handleMITMConnect(w, r, reqID, clientAddr, start)
+		return
+	}
+
+	// 标准 CONNECT 处理（透明隧道）
 	// Establish TCP connection to upstream
 	upstream, err := net.DialTimeout("tcp", host, 10*time.Second)
 	if err != nil {
@@ -480,6 +656,171 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, req
 		log.Printf("[req %s] CONNECT done host=%s client=%s bytes_upstream_to_client=%d bytes_client_to_upstream=%d duration=%s", reqID, host, clientAddr, up2cl, cl2up, dur)
 	} else {
 		log.Printf("CONNECT %s -> done in %s", host, dur)
+	}
+}
+
+// handleMITMConnect 处理 MITM 模式下的 CONNECT 请求
+func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request, reqID string, clientAddr string, start time.Time) {
+	host := r.Host
+
+	// 为目标主机生成证书
+	hostname := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostname = h
+	}
+
+	cert, err := p.mitmCA.GetCertificate(hostname)
+	if err != nil {
+		log.Printf("[req %s] 为 %s 生成证书失败: %v", reqID, hostname, err)
+		http.Error(w, "证书生成失败", http.StatusInternalServerError)
+		return
+	}
+
+	// Hijack client connection
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Send 200 Connection Established
+	_, _ = clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+	if err := clientBuf.Flush(); err != nil {
+		clientConn.Close()
+		return
+	}
+
+	// 创建 TLS 配置
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+	}
+
+	// 将连接升级为 TLS
+	tlsConn := tls.Server(clientConn, tlsConfig)
+	if err := tlsConn.Handshake(); err != nil {
+		log.Printf("[req %s] TLS 握手失败: %v", reqID, err)
+		tlsConn.Close()
+		return
+	}
+
+	// 创建 HTTP 服务器处理解密后的请求
+	connReader := bufio.NewReader(tlsConn)
+	connWriter := bufio.NewWriter(tlsConn)
+
+	// 处理来自客户端的 HTTP 请求
+	for {
+		// 设置读取超时
+		if err := tlsConn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+			break
+		}
+
+		// 读取请求
+		req, err := http.ReadRequest(connReader)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("[req %s] 读取 MITM 请求失败: %v", reqID, err)
+			}
+			break
+		}
+
+		// 修改请求以发送到上游
+		req.URL.Scheme = "https"
+		req.URL.Host = host
+		req.RequestURI = ""
+
+		// 记录请求信息
+		if p.level >= LevelInfo {
+			authPresent := "false"
+			if req.Header.Get("Authorization") != "" {
+				authPresent = "true"
+			}
+			log.Printf("[req %s] MITM HTTP start method=%s url=%s host=%s client=%s ua=%s accept=%s content-type=%s auth=%s",
+				reqID, req.Method, req.URL.String(), req.URL.Host, clientAddr,
+				req.Header.Get("User-Agent"), req.Header.Get("Accept"),
+				req.Header.Get("Content-Type"), authPresent)
+		}
+
+		if p.level >= LevelDebug {
+			// 打印请求头部
+			log.Printf("[req %s] MITM HTTP request headers:", reqID)
+			for k, vs := range req.Header {
+				for _, v := range vs {
+					log.Printf("[req %s] > %s: %s", reqID, k, v)
+				}
+			}
+		}
+
+		// 发送请求到上游
+		resp, err := p.transport.RoundTrip(req)
+		if err != nil {
+			log.Printf("[req %s] MITM 上游请求失败: %v", reqID, err)
+
+			// 向客户端返回错误
+			errResp := &http.Response{
+				StatusCode: http.StatusBadGateway,
+				Status:     "502 Bad Gateway",
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(fmt.Sprintf("upstream error: %v", err))),
+				Request:    req,
+			}
+			errResp.Header.Set("Content-Type", "text/plain")
+			errResp.Header.Set("Connection", "close")
+
+			if err := errResp.Write(connWriter); err != nil {
+				log.Printf("[req %s] 写入错误响应失败: %v", reqID, err)
+			}
+			if err := connWriter.Flush(); err != nil {
+				log.Printf("[req %s] 刷新错误响应失败: %v", reqID, err)
+			}
+			break
+		}
+
+		// 记录响应信息
+		if p.level >= LevelDebug {
+			log.Printf("[req %s] MITM HTTP response headers status=%d:", reqID, resp.StatusCode)
+			for k, vs := range resp.Header {
+				for _, v := range vs {
+					log.Printf("[req %s] < %s: %s", reqID, k, v)
+				}
+			}
+		}
+
+		// 将响应写回客户端
+		resp.Header.Set("Connection", "keep-alive") // 保持连接
+		if err := resp.Write(connWriter); err != nil {
+			log.Printf("[req %s] 写入响应失败: %v", reqID, err)
+			break
+		}
+		if err := connWriter.Flush(); err != nil {
+			log.Printf("[req %s] 刷新响应失败: %v", reqID, err)
+			break
+		}
+
+		// 关闭响应体
+		resp.Body.Close()
+
+		// 检查是否需要关闭连接
+		if resp.Header.Get("Connection") == "close" {
+			break
+		}
+	}
+
+	// 关闭连接
+	tlsConn.Close()
+
+	dur := time.Since(start)
+	if p.level >= LevelInfo {
+		log.Printf("[req %s] MITM CONNECT done host=%s client=%s duration=%s", reqID, host, clientAddr, dur)
+	} else {
+		log.Printf("MITM CONNECT %s -> done in %s", host, dur)
 	}
 }
 
@@ -546,13 +887,13 @@ func main() {
 		display = append(display, cfg.AllowedHosts...)
 	}
 
-	handler := newProxyHandler(allowed, display, insecure, level)
+	handler := newProxyHandler(allowed, display, insecure, level, cfg)
 	srv := &http.Server{
 		Addr:    listenAddr,
 		Handler: logMiddleware(level, handler),
 	}
 
-	log.Printf("registry forward proxy listening on %s", listenAddr)
+	log.Printf("crm listening on %s", listenAddr)
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}

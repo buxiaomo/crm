@@ -1,14 +1,21 @@
 listen: ":8888"
 allowed_hosts:
-  - quay.io
-  - mcr.microsoft.com
-  - docker.io
-  - registry-1.docker.io
-  - gcr.io
-  - k8s.io
-  - registry.k8s.io
-  - docker.elastic.co
-  - ghcr.io
+  - "docker.io"
+  - "registry-1.docker.io"
+  - "registry.k8s.io"
+  - "docker.elastic.co"
+  - "ghcr.io"
+  - "mcr.microsoft.com"
+  - "nvcr.io"
+  - "quay.io"
   - "^.*\\.pkg\\.dev$"
+  - "^.*\\.k8s\\.io$"
+  - "^.*\\.gcr\\.io$"
+
+mitm:
+  enabled: true
+  ca_cert_path: "./ca.crt"
+  ca_key_path: "./ca.key"
+
 insecure_tls: false
 log_level: info
