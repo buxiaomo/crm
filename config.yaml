@@ -19,3 +19,10 @@ mitm:
 
 insecure_tls: false
 log_level: info
+
+# 安全配置 - 支持大文件下载
+security:
+  max_request_size: 10737418240    # 10GB (10 * 1024 * 1024 * 1024)
+  max_header_size: 1048576         # 1MB (1024 * 1024)
+  request_timeout: "30m"           # 30分钟
+  max_concurrent_reqs: 1000        # 最大并发请求数
