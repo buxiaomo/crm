@@ -32,6 +32,50 @@ import (
 	yaml "gopkg.in/yaml.v3"
 )
 
+// 缓冲池用于优化内存分配
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 32*1024) // 32KB buffer
+	},
+}
+
+// 安全配置常量
+// 常量已移动到配置文件中，通过 SecurityConfig 进行配置
+
+// 并发控制
+var concurrentReqs chan struct{}
+
+// 全局配置
+var globalConfig *Config
+
+// 指标统计
+type Metrics struct {
+	TotalRequests     int64
+	ActiveConnections int64
+	TotalBytes        int64
+	ErrorCount        int64
+	StartTime         time.Time
+}
+
+var metrics = &Metrics{
+	StartTime: time.Now(),
+}
+
+// sanitizeUserAgent 对User-Agent进行脱敏处理
+func sanitizeUserAgent(ua string) string {
+	if len(ua) > 100 {
+		return ua[:100] + "..."
+	}
+	// 移除可能的敏感信息（如版本号等）
+	if strings.Contains(ua, "Docker") {
+		return "Docker/***"
+	}
+	if strings.Contains(ua, "containerd") {
+		return "containerd/***"
+	}
+	return ua
+}
+
 // defaultAllowedHosts lists registries allowed to proxy.
 var defaultAllowedHosts = []string{
 	"docker.io",
@@ -44,11 +88,98 @@ var defaultAllowedHosts = []string{
 }
 
 type Config struct {
-	Listen       string     `yaml:"listen" json:"listen"`
-	AllowedHosts []string   `yaml:"allowed_hosts" json:"allowed_hosts"`
-	InsecureTLS  bool       `yaml:"insecure_tls" json:"insecure_tls"`
-	LogLevel     string     `yaml:"log_level" json:"log_level"`
-	MITM         MITMConfig `yaml:"mitm" json:"mitm"`
+	Listen       string         `yaml:"listen" json:"listen"`
+	AllowedHosts []string       `yaml:"allowed_hosts" json:"allowed_hosts"`
+	InsecureTLS  bool           `yaml:"insecure_tls" json:"insecure_tls"`
+	LogLevel     string         `yaml:"log_level" json:"log_level"`
+	MITM         MITMConfig     `yaml:"mitm" json:"mitm"`
+	Security     SecurityConfig `yaml:"security" json:"security"`
+}
+
+// SecurityConfig 安全配置
+type SecurityConfig struct {
+	MaxRequestSize    int64         `yaml:"max_request_size" json:"max_request_size"`       // 最大请求大小（字节）
+	MaxHeaderSize     int64         `yaml:"max_header_size" json:"max_header_size"`         // 最大请求头大小（字节）
+	RequestTimeout    time.Duration `yaml:"request_timeout" json:"request_timeout"`         // 请求超时时间
+	MaxConcurrentReqs int           `yaml:"max_concurrent_reqs" json:"max_concurrent_reqs"` // 最大并发请求数
+}
+
+// Validate validates the configuration
+func (c *Config) Validate() error {
+	if c.Listen == "" {
+		return fmt.Errorf("listen address cannot be empty")
+	}
+
+	// 验证监听地址格式
+	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+		return fmt.Errorf("invalid listen address format: %v", err)
+	}
+
+	// 验证日志级别
+	validLevels := map[string]bool{
+		"debug": true, "info": true, "warn": true, "error": true,
+	}
+	if c.LogLevel != "" && !validLevels[c.LogLevel] {
+		return fmt.Errorf("invalid log level: %s, must be one of: debug, info, warn, error", c.LogLevel)
+	}
+
+	// 验证允许的主机列表
+	if len(c.AllowedHosts) == 0 {
+		log.Println("Warning: no allowed hosts specified, using defaults")
+	}
+
+	// 设置安全配置默认值
+	if c.Security.MaxRequestSize == 0 {
+		c.Security.MaxRequestSize = 10 * 1024 * 1024 * 1024 // 10GB 默认最大请求大小
+	}
+	if c.Security.MaxHeaderSize == 0 {
+		c.Security.MaxHeaderSize = 1024 * 1024 // 1MB 默认最大请求头大小
+	}
+	if c.Security.RequestTimeout == 0 {
+		c.Security.RequestTimeout = 30 * time.Minute // 30分钟默认请求超时
+	}
+	if c.Security.MaxConcurrentReqs == 0 {
+		c.Security.MaxConcurrentReqs = 1000 // 1000 默认最大并发请求数
+	}
+
+	// 验证安全配置范围
+	if c.Security.MaxRequestSize < 1024*1024 { // 最小1MB
+		return fmt.Errorf("max_request_size must be at least 1MB")
+	}
+	if c.Security.MaxHeaderSize < 1024 { // 最小1KB
+		return fmt.Errorf("max_header_size must be at least 1KB")
+	}
+	if c.Security.RequestTimeout < time.Minute { // 最小1分钟
+		return fmt.Errorf("request_timeout must be at least 1 minute")
+	}
+	if c.Security.MaxConcurrentReqs < 1 {
+		return fmt.Errorf("max_concurrent_reqs must be at least 1")
+	}
+
+	return nil
+}
+
+// ErrorResponse represents a structured error response
+type ErrorResponse struct {
+	Error   string `json:"error"`
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// sendErrorResponse sends a structured error response
+func sendErrorResponse(w http.ResponseWriter, statusCode int, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	response := ErrorResponse{
+		Error:   http.StatusText(statusCode),
+		Code:    statusCode,
+		Message: message,
+	}
+
+	// 简单的JSON编码，避免引入额外依赖
+	fmt.Fprintf(w, `{"error":"%s","code":%d,"message":"%s"}`,
+		response.Error, response.Code, response.Message)
 }
 
 // MITMConfig 控制中间人模式的配置
@@ -332,10 +463,13 @@ func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS boo
 		Proxy:                 nil, // do not chain proxies by default
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          200,               // 增加最大空闲连接数
+		MaxIdleConnsPerHost:   50,                // 每个主机的最大空闲连接数
+		MaxConnsPerHost:       100,               // 每个主机的最大连接数
+		IdleConnTimeout:       120 * time.Second, // 延长空闲连接超时
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second, // 添加响应头超时
 		// No caching; Go's transport does not cache by default.
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS},
 	}
@@ -385,16 +519,49 @@ func (wc *writeCounter) Write(p []byte) (int, error) {
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 增加请求计数
+	atomic.AddInt64(&metrics.TotalRequests, 1)
+	atomic.AddInt64(&metrics.ActiveConnections, 1)
+	defer atomic.AddInt64(&metrics.ActiveConnections, -1)
+
+	// 并发控制
+	select {
+	case concurrentReqs <- struct{}{}:
+		defer func() { <-concurrentReqs }()
+	default:
+		atomic.AddInt64(&metrics.ErrorCount, 1)
+		http.Error(w, "服务器繁忙，请稍后重试", http.StatusTooManyRequests)
+		return
+	}
+
+	// 请求大小限制
+	if r.ContentLength > globalConfig.Security.MaxRequestSize {
+		atomic.AddInt64(&metrics.ErrorCount, 1)
+		http.Error(w, "请求体过大", http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// 设置请求超时
+	ctx, cancel := context.WithTimeout(r.Context(), globalConfig.Security.RequestTimeout)
+	defer cancel()
+	r = r.WithContext(ctx)
+
 	start := time.Now()
 	reqID := nextReqID()
 	clientAddr := r.RemoteAddr
 	if i := strings.LastIndex(clientAddr, ":"); i != -1 {
 		clientAddr = clientAddr[:i]
 	}
+
 	// Health check
 	if r.URL.Path == "/healthz" {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		p.serveHealthCheck(w, r)
+		return
+	}
+
+	// Metrics endpoint
+	if r.URL.Path == "/metrics" {
+		p.serveMetrics(w, r)
 		return
 	}
 
@@ -407,7 +574,9 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Handle CONNECT for HTTPS tunneling
 	if r.Method == http.MethodConnect {
 		if p.level >= LevelInfo {
-			log.Printf("[req %s] CONNECT start host=%s client=%s ua=%s", reqID, r.Host, clientAddr, r.Header.Get("User-Agent"))
+			// 日志脱敏：隐藏敏感的User-Agent信息
+			ua := sanitizeUserAgent(r.Header.Get("User-Agent"))
+			log.Printf("[req %s] CONNECT start host=%s client=%s ua=%s", reqID, r.Host, clientAddr, ua)
 		}
 		p.handleConnect(w, r, reqID, clientAddr, start)
 		return
@@ -415,6 +584,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// For normal HTTP proxying, ensure URL is absolute
 	if !r.URL.IsAbs() {
+		atomic.AddInt64(&metrics.ErrorCount, 1)
 		http.Error(w, "proxy requires absolute URL", http.StatusBadRequest)
 		return
 	}
@@ -515,6 +685,8 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// client disconnected or write error; log and ignore
 		log.Printf("stream error: %v", err)
 	}
+	// 统计传输字节数
+	atomic.AddInt64(&metrics.TotalBytes, wc.n)
 
 	dur := time.Since(start)
 	if p.level >= LevelDebug {
@@ -535,6 +707,60 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		log.Printf("%s %s -> %d in %s", r.Method, r.URL.String(), resp.StatusCode, dur)
 	}
+}
+
+// serveMetrics serves basic metrics in plain text format
+func (p *ProxyHandler) serveMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	uptime := time.Since(metrics.StartTime)
+	fmt.Fprintf(w, "# HELP total_requests Total number of requests\n")
+	fmt.Fprintf(w, "# TYPE total_requests counter\n")
+	fmt.Fprintf(w, "total_requests %d\n", atomic.LoadInt64(&metrics.TotalRequests))
+	fmt.Fprintf(w, "# HELP active_connections Current active connections\n")
+	fmt.Fprintf(w, "# TYPE active_connections gauge\n")
+	fmt.Fprintf(w, "active_connections %d\n", atomic.LoadInt64(&metrics.ActiveConnections))
+	fmt.Fprintf(w, "# HELP total_bytes Total bytes transferred\n")
+	fmt.Fprintf(w, "# TYPE total_bytes counter\n")
+	fmt.Fprintf(w, "total_bytes %d\n", atomic.LoadInt64(&metrics.TotalBytes))
+	fmt.Fprintf(w, "# HELP error_count Total error count\n")
+	fmt.Fprintf(w, "# TYPE error_count counter\n")
+	fmt.Fprintf(w, "error_count %d\n", atomic.LoadInt64(&metrics.ErrorCount))
+	fmt.Fprintf(w, "# HELP uptime_seconds Server uptime in seconds\n")
+	fmt.Fprintf(w, "# TYPE uptime_seconds gauge\n")
+	fmt.Fprintf(w, "uptime_seconds %.0f\n", uptime.Seconds())
+}
+
+// serveHealthCheck provides enhanced health check with system status
+func (p *ProxyHandler) serveHealthCheck(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	// 检查系统状态
+	activeConns := atomic.LoadInt64(&metrics.ActiveConnections)
+	errorRate := float64(atomic.LoadInt64(&metrics.ErrorCount)) / float64(atomic.LoadInt64(&metrics.TotalRequests)+1) * 100
+
+	status := "healthy"
+	statusCode := http.StatusOK
+
+	// 健康检查逻辑
+	if activeConns > int64(globalConfig.Security.MaxConcurrentReqs)*8/10 { // 80%阈值
+		status = "degraded"
+		statusCode = http.StatusServiceUnavailable
+	}
+	if errorRate > 10 { // 错误率超过10%
+		status = "unhealthy"
+		statusCode = http.StatusServiceUnavailable
+	}
+
+	w.WriteHeader(statusCode)
+	fmt.Fprintf(w, `{
+		"status": "%s",
+		"timestamp": "%s",
+		"uptime": "%.0fs",
+		"active_connections": %d,
+		"total_requests": %d,
+		"error_rate": "%.2f%%"
+	}`, status, time.Now().Format(time.RFC3339), time.Since(metrics.StartTime).Seconds(),
+		activeConns, atomic.LoadInt64(&metrics.TotalRequests), errorRate)
 }
 
 // serveIndex renders a simple HTML page with allowed registries and usage.
@@ -853,16 +1079,27 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 func tunnelCopy(client net.Conn, upstream net.Conn) (upstreamToClient int64, clientToUpstream int64) {
 	done := make(chan struct{}, 2)
 	var n1, n2 int64
+
+	// 优化的复制函数，使用缓冲池
+	copyWithBuffer := func(dst net.Conn, src net.Conn) int64 {
+		buffer := bufferPool.Get().([]byte)
+		defer bufferPool.Put(buffer)
+
+		n, _ := io.CopyBuffer(dst, src, buffer)
+		// 统计传输字节数
+		atomic.AddInt64(&metrics.TotalBytes, n)
+		return n
+	}
+
 	go func() {
-		n, _ := io.Copy(client, upstream)
-		n1 = n
+		n1 = copyWithBuffer(client, upstream)
 		done <- struct{}{}
 	}()
 	go func() {
-		n, _ := io.Copy(upstream, client)
-		n2 = n
+		n2 = copyWithBuffer(upstream, client)
 		done <- struct{}{}
 	}()
+
 	// Wait for one side to finish then close both to unblock the other
 	<-done
 	_ = client.Close()
@@ -892,6 +1129,15 @@ func main() {
 			log.Fatalf("无法自动加载配置: %v", err)
 		}
 	}
+
+	// 验证配置
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("配置验证失败: %v", err)
+	}
+
+	// 初始化全局配置和并发控制
+	globalConfig = cfg
+	concurrentReqs = make(chan struct{}, cfg.Security.MaxConcurrentReqs)
 
 	// 设置日志级别
 	level := resolveLogLevel(cfg)
@@ -932,8 +1178,12 @@ func main() {
 	// 创建代理处理器和服务器
 	handler := newProxyHandler(allowed, display, insecure, level, cfg)
 	srv := &http.Server{
-		Addr:    listenAddr,
-		Handler: logMiddleware(level, handler),
+		Addr:           listenAddr,
+		Handler:        logMiddleware(level, handler),
+		ReadTimeout:    30 * time.Second,
+		WriteTimeout:   30 * time.Second,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: int(globalConfig.Security.MaxHeaderSize),
 	}
 
 	// 设置优雅关闭
