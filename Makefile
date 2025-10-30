@@ -3,5 +3,6 @@ build:
 	@CGO_ENABLED=1 GO111MODULE=on GOOS=linux go build -o crm main.go
 	@cp -rf crm /usr/local/bin/crm
 	@cp -rf crm.service /etc/systemd/system/crm.service
+	@cp -rf crm.yaml /usr/local/etc/crm.yaml
 	@systemctl enable crm
 	@systemctl restart crm
