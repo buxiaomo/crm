@@ -20,6 +20,7 @@ import (
 	"net/http/httptrace"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -89,6 +90,7 @@ var defaultAllowedHosts = []string{
 
 type Config struct {
 	Listen       string         `yaml:"listen" json:"listen"`
+	SocketPath   string         `yaml:"socket_path" json:"socket_path"`
 	AllowedHosts []string       `yaml:"allowed_hosts" json:"allowed_hosts"`
 	InsecureTLS  bool           `yaml:"insecure_tls" json:"insecure_tls"`
 	LogLevel     string         `yaml:"log_level" json:"log_level"`
@@ -113,6 +115,21 @@ func (c *Config) Validate() error {
 	// 验证监听地址格式
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		return fmt.Errorf("invalid listen address format: %v", err)
+	}
+
+	// 验证 socket 路径（如果提供）
+	if c.SocketPath != "" {
+		// 检查 socket 路径的目录是否存在
+		dir := filepath.Dir(c.SocketPath)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			return fmt.Errorf("socket directory does not exist: %s", dir)
+		}
+		// 如果 socket 文件已存在，尝试删除它
+		if _, err := os.Stat(c.SocketPath); err == nil {
+			if err := os.Remove(c.SocketPath); err != nil {
+				return fmt.Errorf("failed to remove existing socket file: %v", err)
+			}
+		}
 	}
 
 	// 验证日志级别
@@ -1190,14 +1207,52 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 在单独的 goroutine 中启动服务器
+	// 启动服务器的 WaitGroup
+	var wg sync.WaitGroup
+
+	// 在单独的 goroutine 中启动 TCP 服务器
+	wg.Add(1)
 	go func() {
-		// 启动服务器
-		log.Printf("Container Registry Mirrors 正在监听 %s", listenAddr)
+		defer wg.Done()
+		// 启动 TCP 服务器
+		log.Printf("Container Registry Mirrors 正在监听 TCP %s", listenAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("服务器错误: %v", err)
+			log.Fatalf("TCP 服务器错误: %v", err)
 		}
 	}()
+
+	// 如果配置了 Unix socket，启动 Unix socket 服务器
+	var socketSrv *http.Server
+	if cfg.SocketPath != "" {
+		socketSrv = &http.Server{
+			Handler:        logMiddleware(level, handler),
+			ReadTimeout:    30 * time.Second,
+			WriteTimeout:   30 * time.Second,
+			IdleTimeout:    120 * time.Second,
+			MaxHeaderBytes: int(globalConfig.Security.MaxHeaderSize),
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// 创建 Unix socket 监听器
+			listener, err := net.Listen("unix", cfg.SocketPath)
+			if err != nil {
+				log.Fatalf("无法创建 Unix socket 监听器: %v", err)
+			}
+			defer listener.Close()
+
+			// 设置 socket 文件权限
+			if err := os.Chmod(cfg.SocketPath, 0666); err != nil {
+				log.Printf("警告: 无法设置 socket 文件权限: %v", err)
+			}
+
+			log.Printf("Container Registry Mirrors 正在监听 Unix socket %s", cfg.SocketPath)
+			if err := socketSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Fatalf("Unix socket 服务器错误: %v", err)
+			}
+		}()
+	}
 
 	// 等待中断信号
 	<-ctx.Done()
@@ -1207,9 +1262,22 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	// 优雅关闭服务器
+	// 优雅关闭 TCP 服务器
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("服务器关闭出错: %v", err)
+		log.Printf("TCP 服务器关闭出错: %v", err)
+	}
+
+	// 优雅关闭 Unix socket 服务器（如果存在）
+	if socketSrv != nil {
+		if err := socketSrv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("Unix socket 服务器关闭出错: %v", err)
+		}
+		// 清理 socket 文件
+		if cfg.SocketPath != "" {
+			if err := os.Remove(cfg.SocketPath); err != nil {
+				log.Printf("警告: 无法删除 socket 文件: %v", err)
+			}
+		}
 	}
 
 	log.Println("服务器已安全关闭")
