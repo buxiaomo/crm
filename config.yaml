@@ -1,4 +1,5 @@
 listen: ":8888"
+socket_path: "/tmp/crm.sock"  # Unix socket 文件路径
 allowed_hosts:
   - "docker.io"
   - "registry-1.docker.io"
