@@ -605,7 +605,10 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
   </li>
 </ul>
 
-<footer>若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。</footer>
+<footer>
+若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。<br>
+项目地址：<a href="https://github.com/buxiaomo/crm.git" target="_blank">https://github.com/buxiaomo/crm.git</a>
+</footer>
 </body></html>`)
 }
 
