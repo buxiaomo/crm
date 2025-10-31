@@ -1283,13 +1283,89 @@ func main() {
 	log.Println("服务器已安全关闭")
 }
 
+// responseWriter 包装 http.ResponseWriter 以捕获状态码
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	written    bool
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	if !rw.written {
+		rw.statusCode = code
+		rw.written = true
+		rw.ResponseWriter.WriteHeader(code)
+	}
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	if !rw.written {
+		rw.statusCode = http.StatusOK
+		rw.written = true
+	}
+	return rw.ResponseWriter.Write(b)
+}
+
+// getClientIP 获取客户端真实IP地址，支持代理头
+func getClientIP(r *http.Request) string {
+	// 检查 X-Forwarded-For 头（最常用的代理头）
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// X-Forwarded-For 可能包含多个IP，取第一个
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return strings.TrimSpace(xff)
+	}
+
+	// 检查 X-Real-IP 头（Nginx常用）
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return strings.TrimSpace(xri)
+	}
+
+	// 检查 CF-Connecting-IP 头（Cloudflare）
+	if cfip := r.Header.Get("CF-Connecting-IP"); cfip != "" {
+		return strings.TrimSpace(cfip)
+	}
+
+	// 检查 True-Client-IP 头（Akamai）
+	if tcip := r.Header.Get("True-Client-IP"); tcip != "" {
+		return strings.TrimSpace(tcip)
+	}
+
+	// 回退到 RemoteAddr
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return ip
+	}
+	return r.RemoteAddr
+}
+
 func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		
+		// 获取客户端IP
+		clientIP := getClientIP(r)
+		
+		// 包装ResponseWriter以捕获状态码
+		rw := &responseWriter{
+			ResponseWriter: w,
+			statusCode:     http.StatusOK, // 默认状态码
+		}
+		
 		// 基础访问日志：遵循统一的日志级别
 		if level >= LevelInfo {
 			ua := r.Header.Get("User-Agent")
-			log.Printf("%s %s UA=%s", r.Method, r.URL.String(), ua)
+			log.Printf("%s %s IP=%s UA=%s", r.Method, r.URL.String(), clientIP, ua)
 		}
-		next.ServeHTTP(w, r)
+		
+		// 调用下一个处理器
+		next.ServeHTTP(rw, r)
+		
+		// 记录响应信息
+		duration := time.Since(start)
+		if level >= LevelInfo {
+			log.Printf("%s %s IP=%s Status=%d Duration=%s", 
+				r.Method, r.URL.String(), clientIP, rw.statusCode, duration)
+		}
 	})
 }
