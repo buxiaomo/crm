@@ -1,0 +1,8 @@
+mirrors.xiaomo.site {
+    # Gzip compression
+    encode gzip
+    reverse_proxy unix//run/crm.sock
+    tls {
+        reuse_private_keys
+    }
+}
