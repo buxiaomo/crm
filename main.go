@@ -1342,29 +1342,29 @@ func getClientIP(r *http.Request) string {
 func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		
+
 		// 获取客户端IP
 		clientIP := getClientIP(r)
-		
+
 		// 包装ResponseWriter以捕获状态码
 		rw := &responseWriter{
 			ResponseWriter: w,
 			statusCode:     http.StatusOK, // 默认状态码
 		}
-		
+
 		// 基础访问日志：遵循统一的日志级别
 		if level >= LevelInfo {
 			ua := r.Header.Get("User-Agent")
 			log.Printf("%s %s IP=%s UA=%s", r.Method, r.URL.String(), clientIP, ua)
 		}
-		
+
 		// 调用下一个处理器
 		next.ServeHTTP(rw, r)
-		
+
 		// 记录响应信息
 		duration := time.Since(start)
 		if level >= LevelInfo {
-			log.Printf("%s %s IP=%s Status=%d Duration=%s", 
+			log.Printf("%s %s IP=%s Status=%d Duration=%s",
 				r.Method, r.URL.String(), clientIP, rw.statusCode, duration)
 		}
 	})
