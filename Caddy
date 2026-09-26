@@ -1,7 +1,19 @@
 mirrors.xiaomo.site {
-    # Gzip compression
+    log
     encode gzip
-    reverse_proxy unix//run/crm.sock
+    @crawler {
+        header_regexp crawler User-Agent "(?i)(bot|spider|crawler|scrapy)"
+    }
+    route {
+        respond /robots.txt 200 {
+            body <<ROBOTS
+            User-agent: *
+            Disallow: /
+            ROBOTS
+        }
+        respond @crawler "Forbidden" 403
+        reverse_proxy unix//run/crm.sock
+    }
     tls {
         reuse_private_keys
     }
