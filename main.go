@@ -793,7 +793,7 @@ func (p *ProxyHandler) serveHealthCheck(w http.ResponseWriter, r *http.Request) 
 		activeConns, atomic.LoadInt64(&metrics.TotalRequests), errorRate)
 }
 
-// serveIndex renders public usage instructions and the configured registry allowlist.
+// serveIndex renders authentication status, usage instructions, and the registry allowlist.
 func (p *ProxyHandler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!DOCTYPE html><html lang="zh-CN"><head>
@@ -802,9 +802,16 @@ func (p *ProxyHandler) serveIndex(w http.ResponseWriter, r *http.Request) {
 h1{font-size:22px;margin:0 0 12px}h2{font-size:18px;margin:24px 0 8px}code,pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:2px 6px}
 ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 .muted{color:#666;font-size:13px}
+.auth-notice{padding:12px 16px;background:#fff8e1;border:1px solid #e6bd61;border-radius:6px}
 </style></head><body>
 <h1>Container Registry Mirrors</h1>
-<p class="muted">公开镜像加速器：Docker Hub 与 Containerd 白名单内多仓库拉取，服务端完成认证和下载，无磁盘缓存。</p>
+<p class="muted">公开镜像加速器：Docker Hub 与 Containerd 白名单内多仓库拉取，服务端完成认证和下载，无磁盘缓存。</p>`)
+	if p.auth != nil {
+		fmt.Fprint(w, `<p class="auth-notice"><strong>认证已开启</strong>：未授权无法使用镜像加速，请先配置客户端认证。</p>`)
+	} else {
+		fmt.Fprint(w, `<p class="muted">认证未开启：镜像加速允许匿名访问。</p>`)
+	}
+	fmt.Fprint(w, `
 
 <h2>代理允许的仓库</h2>
 <ul>`)
