@@ -10,6 +10,7 @@
 - 配置文件仅对服务账号可读（建议 0600）；修改账号后重启。示例只使用占位密码，不设置 admin/admin 默认凭据。
 - `ProxyHandler.ServeHTTP` 在并发限流和路由之前认证，覆盖首页、healthz、metrics、mirror、普通代理及 CONNECT；无公开豁免。
 - 普通服务请求用 Authorization，失败返回 401 和 `WWW-Authenticate: Basic realm="CRM", charset="UTF-8"`；absolute-form 代理及 CONNECT 用 Proxy-Authorization，失败返回 407 和同格式 Proxy-Authenticate。缺少、重复、畸形、错误凭据均拒绝，不访问上游。
+- 正常 401/407 认证挑战不计入服务故障错误率，避免健康检查误报。
 - 使用 Go 标准库 BasicAuth 解析和 SHA-256 定长摘要的 constant-time 比较。无账号数据库、会话、JWT、token 缓存和新依赖。
 - 服务请求认证成功后移除 Authorization、Proxy-Authorization；代理请求移除 Proxy-Authorization，保留真正的上游 Authorization。CONNECT 在拨号前认证，MITM 继承隧道认证，并丢弃解密请求中的 Proxy-Authorization。
 - mirror 沿用现有请求头白名单和匿名上游 Bearer 流程；本地密码不进入 token、registry 或 CDN。日志隐藏 URL userinfo 与认证头，不记录配置密码。

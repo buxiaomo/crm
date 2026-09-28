@@ -31,20 +31,20 @@
 文件：新增 `auth.go`、`auth_test.go`，修改 `main.go`；复用 `main_test.go`、`mirror_test.go` 的测试设施。
 接口：`AuthConfig{Users map[string]string}`、`Config.Auth *AuthConfig`、`ProxyHandler.auth *AuthConfig`；`(*AuthConfig).Validate() error`、`(*ProxyHandler).authenticate(http.ResponseWriter, *http.Request) bool`。
 
-- [ ] 新增先失败的配置、入口与本地网络 E2E；通过 JSON 加载新配置使旧版本可编译且按行为失败。
-- [ ] 运行 `go test -run 'Test.*Auth' -count=1 .`，记录因缺少认证导致的失败。
-- [ ] 实现上述接口，认证在路由/限流之前；凭据只在所需入口使用并删除。
-- [ ] 修正日志 URL userinfo 和请求认证头脱敏，MITM 出站删除 Proxy-Authorization。
-- [ ] 运行目标测试、`go test -race ./...`、`go vet ./...`，分析而非掩盖失败。
+- [x] 新增先失败的配置、入口与本地网络 E2E；通过 JSON 加载新配置使旧版本可编译且按行为失败。
+- [x] 运行 `go test -run 'Test.*Auth' -count=1 .`，记录因缺少认证导致的失败。
+- [x] 实现上述接口，认证在路由/限流之前；凭据只在所需入口使用并删除。
+- [x] 修正日志 URL userinfo 和请求认证头脱敏，MITM 出站删除 Proxy-Authorization。
+- [x] 运行目标测试、`go test -race ./...`、`go vet ./...`，分析而非掩盖失败。
 
 ## 任务 2：客户端文档与验收
 
 文件：修改 `README.md`、`config.yaml`、`Makefile`（配置安装权限 0600）、`main.go` 首页说明；本计划记录验证结果。
 
-- [ ] 文档说明启用/拒绝默认、curl 交互密码、Containerd 的 CRM host header、代理 407、健康检查认证和客户端兼容性边界。
-- [ ] 只读独立审查实现和测试；主 agent 复核并修复实质问题。
-- [ ] `gofmt`、`git diff --check`，复查全部需求与凭据隔离断言。
-- [ ] 本地提交代码、测试和中文文档，不推送。
+- [x] 文档说明启用/拒绝默认、curl 交互密码、Containerd 的 CRM host header、代理 407、健康检查认证和客户端兼容性边界。
+- [x] 只读独立审查实现和测试；主 agent 复核并修复实质问题。
+- [x] `gofmt`、`git diff --check`，复查全部需求与凭据隔离断言。
+- [x] 本地提交代码、测试和中文文档，不推送。
 
 ## 自查
 
@@ -52,4 +52,13 @@
 
 ## 执行记录
 
-待填写实际命令和结果。
+- 基线 `go test ./...` 通过（3.270s）。
+- RED：原实现的最小 `/v2/` 门禁测试返回 200、预期 401；完整认证测试记录于 `/tmp/crm-basic-auth-agent-red.log`，覆盖未拒绝非法配置、未认证出站及 401/407 缺失。最小门禁用例随后并入覆盖全部入口的表测试，删除重复用例。
+- 日志与 MITM 泄漏分别通过新增断言复现后修复；未改动失败断言以掩盖问题。
+- GREEN：`go test -run 'Test.*Auth|TestMITMBodyLimit' -count=1 .` 通过（1.564s），包含本地真实 HTTP/TLS E2E。
+- `GOCACHE=/tmp/crm-basic-auth-agent-gocache go test -race ./...` 通过（5.038s）；同一 GOCACHE 的 `go vet ./...` 通过。默认构建缓存写入受沙箱限制，改为临时缓存后验证通过，未改测试。
+- 设计审查通过；补充了 YAML 类型错误可能回显密码的回归，配置解码错误只返回文件与格式，不回显输入值。
+- 独立代码审查通过。唯一覆盖缺口已修复：现有 MITM 测试增加 anonymous/authenticated 两组，在 CONNECT 认证后使用独立上游 Bearer，并验证 Proxy-Authorization 不出站。
+- 复核发现正常 401 挑战被计入全局错误率会令 healthz 误报 503；`TestAuthChallengePreservesHealth` 已 RED（503）→GREEN（200），仅移除认证拒绝时的故障计数。
+- 最终 `go test -race -count=1 ./...`、`go vet ./...`、`go build -o /tmp/crm-basic-auth-verified .` 和 `git diff --check` 均通过；构建缓存使用上述临时路径。
+- 只验证本地网络 E2E；未执行外部 Docker/CRI 拉取，未访问线上实例、部署、合并或推送。

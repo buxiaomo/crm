@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
+	"log"
 	"math/big"
 	"net"
 	"net/http"
@@ -207,13 +208,28 @@ func TestUnknownLengthBodyLimit(t *testing.T) {
 }
 
 func TestMITMBodyLimit(t *testing.T) {
+	t.Run("anonymous", func(t *testing.T) { testMITMBodyLimit(t, false) })
+	t.Run("authenticated", func(t *testing.T) { testMITMBodyLimit(t, true) })
+}
+
+func testMITMBodyLimit(t *testing.T, authenticate bool) {
+	t.Helper()
 	p := testProxyHandler(t)
+	if authenticate {
+		enableTestAuth(t, p)
+	}
 	globalConfig.Security.MaxRequestSize = 8
 	globalConfig.Security.RequestTimeout = 3 * time.Second
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Proxy-Authorization") != "" {
+			t.Error("MITM forwarded proxy credentials to upstream")
+		}
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			return
+		}
+		if r.Header.Get("Authorization") != "Bearer upstream-secret" {
+			t.Error("MITM lost the independent upstream authorization")
 		}
 		w.Write(b)
 	}))
@@ -251,6 +267,9 @@ func TestMITMBodyLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if authenticate {
+		proxyURL.User = url.UserPassword(authTestUser, authTestPassword)
+	}
 	roots := x509.NewCertPool()
 	roots.AddCert(root)
 	tr := &http.Transport{Proxy: http.ProxyURL(proxyURL), DisableKeepAlives: true,
@@ -269,7 +288,14 @@ func TestMITMBodyLimit(t *testing.T) {
 		if tt.chunked {
 			body = io.NopCloser(body)
 		}
-		resp, err := client.Post("https://registry.example/v2/upload", "application/octet-stream", body)
+		req, err := http.NewRequest(http.MethodPost, "https://registry.example/v2/upload", body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/octet-stream")
+		req.Header.Set("Proxy-Authorization", "Basic proxy-secret")
+		req.Header.Set("Authorization", "Bearer upstream-secret")
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -505,5 +531,36 @@ func TestHTTPBodyLimitDoesNotWaitForEOF(t *testing.T) {
 		t.Error("oversized HTTP body waited for EOF")
 		writer.Close()
 		<-result
+	}
+}
+
+func TestAuthCredentialsNotLogged(t *testing.T) {
+	p := testProxyHandler(t)
+	p.level = LevelDebug
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	var logs strings.Builder
+	oldOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(oldOutput)
+	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/v2/test", nil)
+	req.URL.User = url.UserPassword("url-secret-user", "url-secret-password")
+	req.SetBasicAuth("upstream-user", "upstream-password")
+	req.Header.Set("Proxy-Authorization", "Basic cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA==")
+	authorization := req.Header.Get("Authorization")
+	response := httptest.NewRecorder()
+	logMiddleware(LevelDebug, p).ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d, want 200", response.Code)
+	}
+	for _, secret := range []string{"url-secret-user", "url-secret-password", authorization, "cHJveHktdXNlcjpwcm94eS1wYXNzd29yZA=="} {
+		if strings.Contains(logs.String(), secret) {
+			t.Error("request credentials leaked to logs")
+		}
+	}
+	if !strings.Contains(logs.String(), "Status=200") {
+		t.Error("request status missing from logs")
 	}
 }

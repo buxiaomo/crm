@@ -7,6 +7,68 @@
 - k8s.io / registry.k8s.io
 - docker.elastic.co / ghcr.io
 
+## CRM 本地账号认证
+
+在服务端配置文件加入以下内容，替换为自己的强密码后重启 CRM：
+
+```yaml
+auth:
+  users:
+    admin: "REPLACE_WITH_A_STRONG_PASSWORD"
+    # 可继续添加其他用户名和密码
+```
+
+省略 `auth`（或设为 `null`）时保持匿名兼容；配置了 `auth` 却没有有效账号时拒绝启动。
+启用后，mirror、首页、`/healthz`、`/metrics` 均需要认证；未携带或错误凭据返回
+`401`，并带 CRM 自己的 Basic 认证挑战。每个请求重新校验，不创建登录会话。
+监控和健康检查也需要携带账号密码。
+
+支持这种 URL 形式：`https://用户名:密码@mirrors.xiaomo.site/v2/...`，
+前提是客户端支持 URL userinfo，并将其转换为 `Authorization: Basic ...`。
+特殊字符需要 URL 编码。更适合日常验证的方式是交互输入密码：
+
+```bash
+curl --user admin \
+  'https://mirrors.xiaomo.site/v2/buxiaomo/kubeasy/manifests/v1.34.12?ns=ghcr.io'
+```
+
+只提供用户名时，curl 会提示输入密码，详见 [curl 文档](https://curl.se/docs/manpage.html#-u)。
+CRM 校验后删除这组凭据；上游 token、Registry 和 CDN 不会收到本地账号密码。
+CRM 仍然只匿名拉取公开镜像，本地认证不会授予上游私有镜像访问权限。
+
+Containerd 在各仓库的 `hosts.toml` 中，为 **CRM host** 增加专属请求头：
+
+```toml
+server = "https://ghcr.io"
+
+[host."https://mirrors.xiaomo.site"]
+  capabilities = ["pull", "resolve"]
+  [host."https://mirrors.xiaomo.site".header]
+    Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"
+```
+
+将占位符替换为 `用户名:密码` 的 Base64（单行、无尾随换行）；其他仓库只需调整
+`server` 和对应目录。不要给上游 host 或全局请求配置这组凭据。
+若要禁止上游直连回退，`server` 也改成 CRM 地址。
+参见 [Containerd header 配置](https://github.com/containerd/containerd/blob/main/docs/hosts.md#header-fields)。
+Docker Engine 的 `registry-mirrors` 能否携带 URL 凭据不能由 curl 成功推断；
+上面的匿名 Docker 示例不适用于需要 Basic 认证的服务，需单独验证运行时支持。
+
+兼容的 HTTP/CONNECT 前向代理使用 **Proxy-Authorization** 认证，缺少或错误时返回
+`407 + Proxy-Authenticate`。例如本机代理可用：
+
+```bash
+curl --proxy http://127.0.0.1:8888 --proxy-user admin https://ghcr.io/v2/
+```
+
+CRM 会移除代理凭据，保留请求原本面向上游的 `Authorization`；MITM 模式先认证
+CONNECT 隧道，不要求在隧道内部重复发送 CRM 凭据。
+
+Basic 和 Base64 不提供加密。对外通过 HTTPS 使用；CRM 裸 HTTP 监听仅用于本机或可信内网。
+配置文件和包含 Basic 头的 `hosts.toml` 应限制为服务账号可读（例如 `chmod 600`），
+不要把真实密码写进 Git 或分享含密码的 URL。已有 Nginx/Caddy 配置默认透传认证头，
+无需在前端再次配置另一套密码。
+
 ## Docker 镜像加速器（推荐）
 
 将以下配置合并到客户端的 `/etc/docker/daemon.json`：
@@ -172,6 +234,7 @@ go build -o crm
 推荐使用 YAML：复制示例 `config.yaml` 并根据需要修改。程序会优先读取当前目录的 `config.yaml` / `config.yml`，其次读取 `config.json`；也可通过命令行 `-config` 指定路径。若未找到配置文件，程序会直接退出并提示错误。
 
 配置项说明：
+- `auth.users`: 可选的 CRM 本地账号密码映射；配置后全部入口要求认证，详见上文。
 - `listen`: 监听地址，例如 `:8888`
 - `socket_path`: 可选 Unix socket 路径，例如 `/run/crm.sock`；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
 - `allowed_hosts`: 在默认白名单基础上追加前向代理及非 Hub mirror 的仓库、认证和下载主机，支持正则表达式（不区分大小写）；Hub mirror 保留固定认证/CDN 范围。

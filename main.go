@@ -90,6 +90,7 @@ var defaultAllowedHosts = []string{
 }
 
 type Config struct {
+	Auth         *AuthConfig    `yaml:"auth" json:"auth"`
 	Listen       string         `yaml:"listen" json:"listen"`
 	SocketPath   string         `yaml:"socket_path" json:"socket_path"`
 	AllowedHosts []string       `yaml:"allowed_hosts" json:"allowed_hosts"`
@@ -109,6 +110,9 @@ type SecurityConfig struct {
 
 // Validate validates the configuration
 func (c *Config) Validate() error {
+	if err := c.Auth.Validate(); err != nil {
+		return err
+	}
 	if c.Listen == "" {
 		return fmt.Errorf("listen address cannot be empty")
 	}
@@ -222,11 +226,11 @@ func loadConfigFrom(path string) (*Config, error) {
 	switch {
 	case strings.HasSuffix(path, ".yaml"), strings.HasSuffix(path, ".yml"):
 		if err := yaml.Unmarshal(b, &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse YAML %s: %w", path, err)
+			return nil, fmt.Errorf("failed to parse YAML %s: check syntax and field types", path)
 		}
 	case strings.HasSuffix(path, ".json"):
 		if err := json.Unmarshal(b, &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse JSON %s: %w", path, err)
+			return nil, fmt.Errorf("failed to parse JSON %s: check syntax and field types", path)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported config file extension: %s", path)
@@ -427,6 +431,7 @@ func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificat
 
 // ProxyHandler implements a simple forward proxy without caching.
 type ProxyHandler struct {
+	auth            *AuthConfig
 	allowedPatterns []*regexp.Regexp
 	allowedDisplay  []string
 	transport       *http.Transport
@@ -460,6 +465,10 @@ func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS boo
 		transport:       tr,
 		level:           level,
 		mitmEnabled:     false,
+	}
+
+	if cfg != nil {
+		handler.auth = cfg.Auth
 	}
 
 	// 如果配置了 MITM 模式，加载 CA 证书
@@ -509,6 +518,11 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&metrics.TotalRequests, 1)
 	atomic.AddInt64(&metrics.ActiveConnections, 1)
 	defer atomic.AddInt64(&metrics.ActiveConnections, -1)
+
+	if !p.authenticate(w, r) {
+		// An authentication challenge does not indicate an unhealthy service.
+		return
+	}
 
 	// 并发控制
 	select {
@@ -597,13 +611,16 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			authPresent = "true"
 		}
-		log.Printf("[req %s] HTTP start method=%s url=%s host=%s client=%s ua=%s accept=%s content-type=%s auth=%s", reqID, r.Method, r.URL.String(), r.URL.Host, clientAddr, r.Header.Get("User-Agent"), r.Header.Get("Accept"), r.Header.Get("Content-Type"), authPresent)
+		log.Printf("[req %s] HTTP start method=%s url=%s host=%s client=%s ua=%s accept=%s content-type=%s auth=%s", reqID, r.Method, logURL(r), r.URL.Host, clientAddr, r.Header.Get("User-Agent"), r.Header.Get("Accept"), r.Header.Get("Content-Type"), authPresent)
 	}
 
 	if p.level >= LevelDebug {
-		// 打印入站请求头部（完整）
+		// 记录非认证请求头
 		log.Printf("[req %s] HTTP request headers:", reqID)
 		for k, vs := range r.Header {
+			if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Proxy-Authorization") {
+				continue
+			}
 			for _, v := range vs {
 				log.Printf("[req %s] > %s: %s", reqID, k, v)
 			}
@@ -709,7 +726,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[req %s] HTTP done status=%d bytes_sent=%d content-length=%s duration=%s", reqID, resp.StatusCode, n, cl, dur)
 	} else {
-		log.Printf("%s %s -> %d in %s", r.Method, r.URL.String(), resp.StatusCode, dur)
+		log.Printf("%s %s -> %d in %s", r.Method, logURL(r), resp.StatusCode, dur)
 	}
 }
 
@@ -787,6 +804,18 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 </style></head><body>
 <h1>Container Registry Mirrors</h1>
 <p class="muted">公开镜像加速器：Docker Hub 与 Containerd 白名单内多仓库拉取，服务端完成认证和下载，无磁盘缓存。</p>
+
+<h2>CRM 本地账号认证（可选）</h2>
+<pre>auth:
+  users:
+    admin: "REPLACE_WITH_A_STRONG_PASSWORD"</pre>
+<p>配置 auth.users 并重启后，mirror、首页、healthz 和 metrics 都要求 Basic 认证，失败返回 401；HTTP/CONNECT 前向代理使用 Proxy-Authorization，失败返回 407。省略 auth 保持匿名访问。</p>
+<pre>curl --user admin 'https://mirrors.xiaomo.site/v2/buxiaomo/kubeasy/manifests/v1.34.12?ns=ghcr.io'</pre>
+<p>curl 会提示输入密码。支持 URL 凭据的客户端也可用 https://用户名:密码@mirrors.xiaomo.site/v2/...，但不要分享或保存含密码的 URL。CRM 校验后丢弃本地凭据，上游继续匿名拉取。</p>
+<p>Containerd 为 CRM host 单独配置请求头：</p>
+<pre>[host."https://mirrors.xiaomo.site".header]
+  Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
+<p>Base64 不是加密；对外必须使用 HTTPS，并限制密码配置文件读取权限。启用认证后，以下匿名 Docker 示例不能直接套用，需另外验证客户端认证支持。</p>
 
 <h2>代理允许的仓库</h2>
 <ul>`)
@@ -1037,6 +1066,7 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 		req.URL.Host = host
 		req.Host = host
 		req.RequestURI = ""
+		req.Header.Del("Proxy-Authorization")
 		// The tunnel owns this body; Transport must not drain it after a size error.
 		req.Body = http.MaxBytesReader(nil, io.NopCloser(req.Body), globalConfig.Security.MaxRequestSize)
 
@@ -1047,7 +1077,7 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 				authPresent = "true"
 			}
 			log.Printf("[req %s] MITM HTTP start method=%s url=%s host=%s client=%s ua=%s accept=%s content-type=%s auth=%s",
-				reqID, req.Method, req.URL.String(), req.URL.Host, clientAddr,
+				reqID, req.Method, logURL(req), req.URL.Host, clientAddr,
 				req.Header.Get("User-Agent"), req.Header.Get("Accept"),
 				req.Header.Get("Content-Type"), authPresent)
 		}
@@ -1056,6 +1086,9 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 			// 打印请求头部
 			log.Printf("[req %s] MITM HTTP request headers:", reqID)
 			for k, vs := range req.Header {
+				if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Proxy-Authorization") {
+					continue
+				}
 				for _, v := range vs {
 					log.Printf("[req %s] > %s: %s", reqID, k, v)
 				}
@@ -1400,6 +1433,13 @@ func getClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// logURL excludes credentials supplied in URL userinfo.
+func logURL(r *http.Request) string {
+	u := *r.URL
+	u.User = nil
+	return u.String()
+}
+
 func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -1416,7 +1456,7 @@ func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 		// 基础访问日志：遵循统一的日志级别
 		if level >= LevelInfo {
 			ua := r.Header.Get("User-Agent")
-			log.Printf("%s %s IP=%s UA=%s", r.Method, r.URL.String(), clientIP, ua)
+			log.Printf("%s %s IP=%s UA=%s", r.Method, logURL(r), clientIP, ua)
 		}
 
 		// 调用下一个处理器
@@ -1426,7 +1466,7 @@ func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 		duration := time.Since(start)
 		if level >= LevelInfo {
 			log.Printf("%s %s IP=%s Status=%d Duration=%s",
-				r.Method, r.URL.String(), clientIP, rw.statusCode, duration)
+				r.Method, logURL(r), clientIP, rw.statusCode, duration)
 		}
 	})
 }
