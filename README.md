@@ -7,7 +7,55 @@
 - k8s.io / registry.k8s.io
 - docker.elastic.co / ghcr.io
 
+## CRM 本地账号认证（可选）
+
+此项为服务端部署运维配置。需要限制 CRM 使用者时，在服务端配置文件加入以下内容，替换为自己的强密码后重启 CRM：
+
+```yaml
+auth:
+  users:
+    admin: "REPLACE_WITH_A_STRONG_PASSWORD"
+    # 可继续添加其他用户名和密码
+```
+
+省略 `auth`（或设为 `null`）时保持匿名兼容；配置了 `auth` 却没有有效账号时拒绝启动。
+启用后，mirror 需要认证；未携带或错误凭据返回
+`401`，并带 CRM 自己的 Basic 认证挑战。每个请求重新校验，不创建登录会话。
+仅普通 `GET /`、`GET /healthz` 和 `GET /metrics` 允许匿名访问；其他方法、路径和前向代理请求仍要求认证。
+首页展示默认及自定义仓库白名单，不展示账号密码；监控接口会公开请求量、流量、错误率、连接数和运行时间等聚合信息。
+
+支持这种 URL 形式：`https://用户名:密码@mirrors.xiaomo.site/v2/...`，
+前提是客户端支持 URL userinfo，并将其转换为 `Authorization: Basic ...`。
+特殊字符需要 URL 编码。更适合日常验证的方式是交互输入密码：
+
+```bash
+curl --user admin \
+  'https://mirrors.xiaomo.site/v2/buxiaomo/kubeasy/manifests/v1.34.12?ns=ghcr.io'
+```
+
+只提供用户名时，curl 会提示输入密码，详见 [curl 文档](https://curl.se/docs/manpage.html#-u)。
+CRM 校验后删除这组凭据；上游 token、Registry 和 CDN 不会收到本地账号密码。
+CRM 仍然只匿名拉取公开镜像，本地认证不会授予上游私有镜像访问权限。
+
+兼容的 HTTP/CONNECT 前向代理使用 **Proxy-Authorization** 认证，缺少或错误时返回
+`407 + Proxy-Authenticate`。例如 CRM 使用 TCP 模式（`listen: ":8888"`）时，本机代理可用：
+
+```bash
+curl --proxy http://127.0.0.1:8888 --proxy-user admin https://ghcr.io/v2/
+```
+
+CRM 会移除代理凭据，保留请求原本面向上游的 `Authorization`；MITM 模式先认证
+CONNECT 隧道，不要求在隧道内部重复发送 CRM 凭据。
+
+Basic 和 Base64 不提供加密。对外通过 HTTPS 使用；CRM 裸 HTTP 监听仅用于本机或可信内网。
+配置文件应限制为服务账号可读（例如 `chmod 600`），
+不要把真实密码写进 Git 或分享含密码的 URL。已有 Nginx/Caddy 配置默认透传认证头，
+无需在前端再次配置另一套密码。
+
 ## Docker 镜像加速器（推荐）
+
+本节示例适用于匿名访问。CRM 启用 Basic 认证时，需单独验证 Docker Engine 的认证支持；
+`registry-mirrors` 能否携带 URL 凭据不能由 curl 成功推断。
 
 将以下配置合并到客户端的 `/etc/docker/daemon.json`：
 
@@ -95,6 +143,19 @@ server = "https://gcr.io"
   capabilities = ["pull", "resolve"]
 ```
 
+如果 CRM 要求账号认证，在上述各仓库的 `hosts.toml` 中，为 **CRM host** 添加以下请求头。
+Containerd 不会从 host URL 中读取用户名和密码，不要使用 `https://用户名:密码@镜像站`：
+
+```toml
+[host."https://mirrors.xiaomo.site".header]
+  Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"
+```
+
+对不带换行的 `用户名:密码` 做 Base64 编码，将单行结果填入占位符。
+不要给上游 host 或全局请求配置这组凭据；CRM 校验后不会将其转发到上游。
+Base64 不是加密，必须使用 HTTPS，并限制 `hosts.toml` 为服务账号可读（例如 `chmod 600`）。
+参见 [Containerd header 配置](https://github.com/containerd/containerd/blob/main/docs/hosts.md#header-fields)。
+
 Containerd 自动附加 `?ns=ghcr.io` 或 `?ns=gcr.io`，CRM 在白名单内选择上游；
 无 `ns` 时仍使用 Docker Hub。仓库地址仅支持 HTTPS 默认端口或 443。
 CRM 在服务端处理匿名 Bearer 认证和下载跳转，不转发客户端凭证。
@@ -172,6 +233,7 @@ go build -o crm
 推荐使用 YAML：复制示例 `config.yaml` 并根据需要修改。程序会优先读取当前目录的 `config.yaml` / `config.yml`，其次读取 `config.json`；也可通过命令行 `-config` 指定路径。若未找到配置文件，程序会直接退出并提示错误。
 
 配置项说明：
+- `auth.users`: 可选的 CRM 本地账号密码映射；配置后镜像拉取和代理要求认证，首页与监控的普通 GET 请求公开，详见上文。
 - `listen`: 唯一监听入口。端口或 TCP 地址（如 `8888`、`:8888`、`127.0.0.1:8888`、`[::1]:8888`）使用 TCP；绝对路径（如 `/run/crm.sock`）使用 Unix socket。不能为空，不支持相对 socket 路径，不会同时开启两种入口。socket 目录须存在；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
 - `allowed_hosts`: 在默认白名单基础上追加前向代理及非 Hub mirror 的仓库、认证和下载主机，支持正则表达式（不区分大小写）；Hub mirror 保留固定认证/CDN 范围。
   - 普通域名按“精确匹配”处理，例如 `docker.io`；点号不会触发正则匹配，也不会自动放行子域名。
@@ -213,7 +275,8 @@ listen: "/run/crm.sock"
 curl -v -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/
 ```
 
-未携带认证信息时，Docker Registry 返回 `401 Unauthorized` 是正常的认证挑战，可用于确认代理连通性。
+CRM 启用本地认证时，上例需增加 `--proxy-user 用户名` 并按提示输入密码，否则会先收到 CRM 的 `407 Proxy Authentication Required`。
+请求到达上游后，Docker Registry 返回 `401 Unauthorized` 是正常的认证挑战，可用于确认代理连通性。
 
 ### Docker Engine
 

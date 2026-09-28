@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math/big"
@@ -91,6 +92,7 @@ var defaultAllowedHosts = []string{
 }
 
 type Config struct {
+	Auth         *AuthConfig    `yaml:"auth" json:"auth"`
 	Listen       string         `yaml:"listen" json:"listen"`
 	AllowedHosts []string       `yaml:"allowed_hosts" json:"allowed_hosts"`
 	InsecureTLS  bool           `yaml:"insecure_tls" json:"insecure_tls"`
@@ -109,6 +111,9 @@ type SecurityConfig struct {
 
 // Validate validates the configuration
 func (c *Config) Validate() error {
+	if err := c.Auth.Validate(); err != nil {
+		return err
+	}
 	if c.Listen == "" {
 		return fmt.Errorf("listen address cannot be empty")
 	}
@@ -224,11 +229,11 @@ func loadConfigFrom(path string) (*Config, error) {
 	switch {
 	case strings.HasSuffix(path, ".yaml"), strings.HasSuffix(path, ".yml"):
 		if err := yaml.Unmarshal(b, &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse YAML %s: %w", path, err)
+			return nil, fmt.Errorf("failed to parse YAML %s: check syntax and field types", path)
 		}
 	case strings.HasSuffix(path, ".json"):
 		if err := json.Unmarshal(b, &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse JSON %s: %w", path, err)
+			return nil, fmt.Errorf("failed to parse JSON %s: check syntax and field types", path)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported config file extension: %s", path)
@@ -429,6 +434,7 @@ func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificat
 
 // ProxyHandler implements a simple forward proxy without caching.
 type ProxyHandler struct {
+	auth            *AuthConfig
 	allowedPatterns []*regexp.Regexp
 	allowedDisplay  []string
 	transport       *http.Transport
@@ -440,7 +446,7 @@ type ProxyHandler struct {
 	mitmAllowed []*regexp.Regexp
 }
 
-func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS bool, level LogLevel, cfg *Config) *ProxyHandler {
+func newProxyHandler(allowed []*regexp.Regexp, insecureTLS bool, level LogLevel, cfg *Config) *ProxyHandler {
 	tr := &http.Transport{
 		Proxy:                 nil, // do not chain proxies by default
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -458,10 +464,15 @@ func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS boo
 
 	handler := &ProxyHandler{
 		allowedPatterns: allowed,
-		allowedDisplay:  display,
+		allowedDisplay:  append([]string(nil), defaultAllowedHosts...),
 		transport:       tr,
 		level:           level,
 		mitmEnabled:     false,
+	}
+
+	if cfg != nil {
+		handler.auth = cfg.Auth
+		handler.allowedDisplay = append(handler.allowedDisplay, cfg.AllowedHosts...)
 	}
 
 	// 如果配置了 MITM 模式，加载 CA 证书
@@ -512,6 +523,11 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&metrics.ActiveConnections, 1)
 	defer atomic.AddInt64(&metrics.ActiveConnections, -1)
 
+	if !p.authenticate(w, r) {
+		// An authentication challenge does not indicate an unhealthy service.
+		return
+	}
+
 	// 并发控制
 	select {
 	case concurrentReqs <- struct{}{}:
@@ -546,22 +562,21 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clientAddr = clientAddr[:i]
 	}
 
-	// Health check
-	if r.URL.Path == "/healthz" {
-		p.serveHealthCheck(w, r)
-		return
-	}
-
-	// Metrics endpoint
-	if r.URL.Path == "/metrics" {
-		p.serveMetrics(w, r)
-		return
-	}
-
-	// Index page: show supported registries and usage
-	if r.URL.Path == "/" && r.Method == http.MethodGet {
-		p.serveIndex(w, r)
-		return
+	// Local informational endpoints must not intercept forward-proxy targets.
+	if !r.URL.IsAbs() && r.URL.Host == "" {
+		switch r.URL.EscapedPath() {
+		case "/healthz":
+			p.serveHealthCheck(w, r)
+			return
+		case "/metrics":
+			p.serveMetrics(w, r)
+			return
+		case "/":
+			if r.Method == http.MethodGet {
+				p.serveIndex(w, r)
+				return
+			}
+		}
 	}
 
 	// Handle CONNECT for HTTPS tunneling
@@ -599,13 +614,16 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "" {
 			authPresent = "true"
 		}
-		log.Printf("[req %s] HTTP start method=%s url=%s host=%s client=%s ua=%s accept=%s content-type=%s auth=%s", reqID, r.Method, r.URL.String(), r.URL.Host, clientAddr, r.Header.Get("User-Agent"), r.Header.Get("Accept"), r.Header.Get("Content-Type"), authPresent)
+		log.Printf("[req %s] HTTP start method=%s url=%s host=%s client=%s ua=%s accept=%s content-type=%s auth=%s", reqID, r.Method, logURL(r), r.URL.Host, clientAddr, r.Header.Get("User-Agent"), r.Header.Get("Accept"), r.Header.Get("Content-Type"), authPresent)
 	}
 
 	if p.level >= LevelDebug {
-		// 打印入站请求头部（完整）
+		// 记录非认证请求头
 		log.Printf("[req %s] HTTP request headers:", reqID)
 		for k, vs := range r.Header {
+			if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Proxy-Authorization") {
+				continue
+			}
 			for _, v := range vs {
 				log.Printf("[req %s] > %s: %s", reqID, k, v)
 			}
@@ -711,7 +729,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[req %s] HTTP done status=%d bytes_sent=%d content-length=%s duration=%s", reqID, resp.StatusCode, n, cl, dur)
 	} else {
-		log.Printf("%s %s -> %d in %s", r.Method, r.URL.String(), resp.StatusCode, dur)
+		log.Printf("%s %s -> %d in %s", r.Method, logURL(r), resp.StatusCode, dur)
 	}
 }
 
@@ -777,7 +795,7 @@ func (p *ProxyHandler) serveHealthCheck(w http.ResponseWriter, r *http.Request) 
 		activeConns, atomic.LoadInt64(&metrics.TotalRequests), errorRate)
 }
 
-// serveIndex renders a simple HTML page with allowed registries and usage.
+// serveIndex renders public usage instructions and the configured registry allowlist.
 func (p *ProxyHandler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!DOCTYPE html><html lang="zh-CN"><head>
@@ -792,23 +810,23 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 
 <h2>代理允许的仓库</h2>
 <ul>`)
-	// list displays
 	shown := make(map[string]struct{})
-	for _, h := range p.allowedDisplay {
-		s := strings.TrimSpace(h)
-		if s == "" {
+	for _, host := range p.allowedDisplay {
+		host = strings.TrimSpace(host)
+		if host == "" {
 			continue
 		}
-		key := strings.ToLower(s)
+		key := strings.ToLower(host)
 		if _, ok := shown[key]; ok {
 			continue
 		}
 		shown[key] = struct{}{}
-		fmt.Fprintf(w, "<li>%s</li>\n", s)
+		fmt.Fprintf(w, "<li>%s</li>\n", html.EscapeString(host))
 	}
 	fmt.Fprint(w, `</ul>
 
 <h2>Docker 镜像加速</h2>
+<p>以下示例适用于匿名访问；CRM 启用 Basic 认证时，需另外验证 Docker Engine 的认证支持，不能由 curl 成功推断。</p>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
 <pre>{
   "registry-mirrors": ["https://mirrors.xiaomo.site"]
@@ -846,6 +864,10 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 
 [host."https://mirrors.xiaomo.site"]
   capabilities = ["pull", "resolve"]</pre>
+<p>如果 CRM 要求账号认证，在上述各仓库的 hosts.toml 中为 CRM host 添加以下请求头；Containerd 不会从 host URL 中读取用户名和密码：</p>
+<pre>[host."https://mirrors.xiaomo.site".header]
+  Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
+<p>对不带换行的“用户名:密码”做 Base64 编码，将单行结果填入占位符。仅为 CRM host 配置此请求头，CRM 校验后不会将其转发到上游。Base64 不是加密，必须使用 HTTPS，并限制 hosts.toml 为服务账号可读。</p>
 <p>Containerd 自动通过 ns 参数选择原仓库；CRM 只允许白名单内仓库的 HTTPS 默认/443 端口。无 ns 时仍使用 Docker Hub。仅支持公开镜像，不转发客户端登录凭证。</p>
 <p>GHCR 下载域名 pkg-containers.githubusercontent.com 已内置。其他仓库的认证/CDN 域名需要在 allowed_hosts 中按实际情况放行；请使用精确域名或带边界的正则。</p>
 <p>修改 config.toml 后重启并通过 CRI 验证；仅修改 hosts.toml 无需重启：</p>
@@ -886,6 +908,7 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
 <h2>可选：前向代理</h2>
 <p>前向代理需要将 listen 配置为 TCP 地址（例如 :8888）；Unix socket 模式不开放 TCP 端口。请将下例中的 proxy.example.com:8888 替换为实际代理地址。</p>
 <pre>curl -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/</pre>
+<p>如需代理认证，curl 命令增加 <code>--proxy-user 用户名</code> 并按提示输入密码；凭据仅用于 CRM 认证。</p>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
 <pre>{
   "proxies": {
@@ -1039,6 +1062,7 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 		req.URL.Host = host
 		req.Host = host
 		req.RequestURI = ""
+		req.Header.Del("Proxy-Authorization")
 		// The tunnel owns this body; Transport must not drain it after a size error.
 		req.Body = http.MaxBytesReader(nil, io.NopCloser(req.Body), globalConfig.Security.MaxRequestSize)
 
@@ -1049,7 +1073,7 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 				authPresent = "true"
 			}
 			log.Printf("[req %s] MITM HTTP start method=%s url=%s host=%s client=%s ua=%s accept=%s content-type=%s auth=%s",
-				reqID, req.Method, req.URL.String(), req.URL.Host, clientAddr,
+				reqID, req.Method, logURL(req), req.URL.Host, clientAddr,
 				req.Header.Get("User-Agent"), req.Header.Get("Accept"),
 				req.Header.Get("Content-Type"), authPresent)
 		}
@@ -1058,6 +1082,9 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 			// 打印请求头部
 			log.Printf("[req %s] MITM HTTP request headers:", reqID)
 			for k, vs := range req.Header {
+				if strings.EqualFold(k, "Authorization") || strings.EqualFold(k, "Proxy-Authorization") {
+					continue
+				}
 				for _, v := range vs {
 					log.Printf("[req %s] > %s: %s", reqID, k, v)
 				}
@@ -1248,15 +1275,8 @@ func main() {
 		}
 	}
 
-	// 构建显示列表
-	display := make([]string, 0, len(defaultAllowedHosts))
-	display = append(display, defaultAllowedHosts...)
-	if cfg != nil && len(cfg.AllowedHosts) > 0 {
-		display = append(display, cfg.AllowedHosts...)
-	}
-
 	// 创建代理处理器和服务器
-	handler := newProxyHandler(allowed, display, insecure, level, cfg)
+	handler := newProxyHandler(allowed, insecure, level, cfg)
 	srv := &http.Server{
 		Handler:           logMiddleware(level, handler),
 		ReadHeaderTimeout: 30 * time.Second,
@@ -1371,6 +1391,13 @@ func getClientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// logURL excludes credentials supplied in URL userinfo.
+func logURL(r *http.Request) string {
+	u := *r.URL
+	u.User = nil
+	return u.String()
+}
+
 func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -1387,7 +1414,7 @@ func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 		// 基础访问日志：遵循统一的日志级别
 		if level >= LevelInfo {
 			ua := r.Header.Get("User-Agent")
-			log.Printf("%s %s IP=%s UA=%s", r.Method, r.URL.String(), clientIP, ua)
+			log.Printf("%s %s IP=%s UA=%s", r.Method, logURL(r), clientIP, ua)
 		}
 
 		// 调用下一个处理器
@@ -1397,7 +1424,7 @@ func logMiddleware(level LogLevel, next http.Handler) http.Handler {
 		duration := time.Since(start)
 		if level >= LevelInfo {
 			log.Printf("%s %s IP=%s Status=%d Duration=%s",
-				r.Method, r.URL.String(), clientIP, rw.statusCode, duration)
+				r.Method, logURL(r), clientIP, rw.statusCode, duration)
 		}
 	})
 }
