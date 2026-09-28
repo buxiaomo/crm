@@ -137,18 +137,53 @@ func TestCanceledHTTP(t *testing.T) {
 	}
 }
 
+func TestValidateListenerSelection(t *testing.T) {
+	socket := testSocketPath(t)
+	for _, tt := range []struct {
+		name    string
+		listen  string
+		want    string
+		wantErr string
+	}{
+		{name: "TCP port", listen: "8888", want: ":8888"},
+		{name: "TCP address", listen: ":8888", want: ":8888"},
+		{name: "TCP host", listen: "127.0.0.1:8888", want: "127.0.0.1:8888"},
+		{name: "TCP IPv6", listen: "[::1]:8888", want: "[::1]:8888"},
+		{name: "Unix path", listen: socket, want: socket},
+		{name: "empty", wantErr: "listen address cannot be empty"},
+		{name: "invalid TCP", listen: "localhost", wantErr: "invalid listen address format"},
+		{name: "relative socket path", listen: "./crm.sock", wantErr: "invalid listen address format"},
+		{name: "missing socket directory", listen: filepath.Join(filepath.Dir(socket), "missing", "crm.sock"), wantErr: "socket directory does not exist"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{Listen: tt.listen}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				if cfg.Listen != tt.want {
+					t.Errorf("Listen = %q, want %q", cfg.Listen, tt.want)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidatePreservesRegularFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "important.txt")
 	if err := os.WriteFile(path, []byte("keep"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := &Config{Listen: ":8888", SocketPath: path}
+	cfg := &Config{Listen: path}
 	err := cfg.Validate()
-	if err == nil {
-		t.Error("expected rejection of a non-socket path")
+	if err == nil || !strings.Contains(err.Error(), "socket path is not a socket") {
+		t.Errorf("expected rejection of a non-socket path, got %v", err)
 	}
-	if _, statErr := os.Stat(path); os.IsNotExist(statErr) {
-		t.Fatalf("Validate deleted a regular file (validation error: %v)", err)
+	if data, readErr := os.ReadFile(path); readErr != nil || string(data) != "keep" {
+		t.Fatalf("Validate changed a regular file: %q, %v", data, readErr)
 	}
 }
 
@@ -332,7 +367,7 @@ func TestSocketValidationHasNoSideEffects(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	cfg := &Config{Listen: ":8888", SocketPath: path}
+	cfg := &Config{Listen: path}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -349,9 +384,9 @@ func TestSocketValidationHasNoSideEffects(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	cfg.SocketPath = link
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("accepted symlink as socket path")
+	cfg.Listen = link
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "socket path is not a socket") {
+		t.Fatalf("expected rejection of a symlink, got %v", err)
 	}
 	if _, err := os.Lstat(link); err != nil {
 		t.Fatalf("validation removed symlink: %v", err)

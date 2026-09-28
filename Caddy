@@ -1,5 +1,5 @@
 # Docker Hub mirror、首页、健康检查和指标入口；registry-mirrors 指向此 HTTPS 域名。
-# 可选 HTTP/CONNECT 前向代理仍使用 CRM 的 HTTP 端口 8888。
+# CRM 默认 listen: "/run/crm.sock"；切换 TCP 模式时将上游改为 127.0.0.1:8888。
 mirrors.xiaomo.site {
     log
     encode gzip

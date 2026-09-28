@@ -172,8 +172,7 @@ go build -o crm
 推荐使用 YAML：复制示例 `config.yaml` 并根据需要修改。程序会优先读取当前目录的 `config.yaml` / `config.yml`，其次读取 `config.json`；也可通过命令行 `-config` 指定路径。若未找到配置文件，程序会直接退出并提示错误。
 
 配置项说明：
-- `listen`: 监听地址，例如 `:8888`
-- `socket_path`: 可选 Unix socket 路径，例如 `/run/crm.sock`；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
+- `listen`: 唯一监听入口。端口或 TCP 地址（如 `8888`、`:8888`、`127.0.0.1:8888`、`[::1]:8888`）使用 TCP；绝对路径（如 `/run/crm.sock`）使用 Unix socket。不能为空，不支持相对 socket 路径，不会同时开启两种入口。socket 目录须存在；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
 - `allowed_hosts`: 在默认白名单基础上追加前向代理及非 Hub mirror 的仓库、认证和下载主机，支持正则表达式（不区分大小写）；Hub mirror 保留固定认证/CDN 范围。
   - 普通域名按“精确匹配”处理，例如 `docker.io`；点号不会触发正则匹配，也不会自动放行子域名。
   - 使用正则元字符时按正则匹配，例如 `^.*\.k8s\.io$` 匹配所有以 `.k8s.io` 结尾的域名。
@@ -188,9 +187,23 @@ go build -o crm
 - `security.max_header_size`: HTTP 入口请求头上限（字节）。
 - `security.max_concurrent_reqs`: 最大并发 HTTP 请求或 CONNECT 隧道数。
 
+以下配置二选一。TCP 模式：
+
+```yaml
+listen: ":8888"  # 也可写为 "8888" 或 "127.0.0.1:8888"
+```
+
+Unix socket 模式（仓库默认）：
+
+```yaml
+listen: "/run/crm.sock"
+```
+
+升级旧配置时，删除 `socket_path`。如果原先使用 socket，将其路径移到 `listen`；若保留 `listen: ":8888"`，则只启动 TCP，旧 `socket_path` 不再生效。
+
 ## 前向代理使用示例（兼容可选）
 
-需要前向代理时，可使用以下兼容配置，客户端连接代理服务器的 HTTP 端口。Docker Hub 镜像加速请优先使用上面的 `registry-mirrors` 配置。
+需要前向代理时，先将 CRM 设置为 TCP 模式（例如 `listen: ":8888"`），客户端连接代理服务器的 HTTP 端口。Docker Hub 镜像加速请优先使用上面的 `registry-mirrors` 配置。
 
 下例中的 `proxy.example.com:8888` 应替换为实际代理地址；同机运行可使用 `127.0.0.1:8888`。
 
@@ -247,7 +260,7 @@ sudo systemctl restart containerd
 
 仓库中的 `Caddy` 和 `nginx.conf` 提供 mirror API、首页、健康检查和指标入口；`registry-mirrors` 指向该 HTTPS 域名。示例与 `config.yaml` 统一使用 `/run/crm.sock`，目录须存在且服务用户可写，反向代理用户须能访问 socket。nginx 示例关闭响应缓冲，避免镜像层写入临时文件。
 
-这些普通反向代理配置不提供 CONNECT 隧道；使用前向代理的 Docker/Containerd 客户端仍应连接 CRM 的 `8888` 端口。
+这些普通反向代理配置不提供 CONNECT 隧道。socket 模式不开放 TCP 端口；需要前向代理时，将 `listen` 改为 TCP 地址，并将 Caddy 的 `reverse_proxy` 或 nginx 的 `upstream` 地址改为 `127.0.0.1:8888`（端口与 CRM 配置保持一致），客户端再连接 CRM 的端口。
 
 ## MITM 模式
 
@@ -352,6 +365,14 @@ make build
 ```
 
 `make build` 生成 Linux amd64 二进制；本机运行请使用上面的 `go build`。
+
+### 监听入口 E2E
+
+```bash
+bash tests/e2e-listener.sh
+```
+
+需要 Go、Bash 和 curl。脚本构建本机二进制，使用随机 TCP 端口和临时 Unix socket 验证单入口监听、健康检查、错误配置、活动 socket 保护和退出清理；无需 Docker 或外网。
 
 ### 隔离 Docker 拉取 E2E
 

@@ -23,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,7 +92,6 @@ var defaultAllowedHosts = []string{
 
 type Config struct {
 	Listen       string         `yaml:"listen" json:"listen"`
-	SocketPath   string         `yaml:"socket_path" json:"socket_path"`
 	AllowedHosts []string       `yaml:"allowed_hosts" json:"allowed_hosts"`
 	InsecureTLS  bool           `yaml:"insecure_tls" json:"insecure_tls"`
 	LogLevel     string         `yaml:"log_level" json:"log_level"`
@@ -113,24 +113,26 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("listen address cannot be empty")
 	}
 
-	// 验证监听地址格式
-	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
-		return fmt.Errorf("invalid listen address format: %v", err)
-	}
-
-	// 验证 socket 路径（如果提供）
-	if c.SocketPath != "" {
+	if filepath.IsAbs(c.Listen) {
 		// 检查 socket 路径的目录是否存在
-		dir := filepath.Dir(c.SocketPath)
+		dir := filepath.Dir(c.Listen)
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			return fmt.Errorf("socket directory does not exist: %s", dir)
 		}
-		if info, err := os.Lstat(c.SocketPath); err == nil {
+		if info, err := os.Lstat(c.Listen); err == nil {
 			if info.Mode()&os.ModeSocket == 0 {
-				return fmt.Errorf("socket path is not a socket: %s", c.SocketPath)
+				return fmt.Errorf("socket path is not a socket: %s", c.Listen)
 			}
 		} else if !os.IsNotExist(err) {
 			return fmt.Errorf("check socket path: %w", err)
+		}
+	} else {
+		// 裸端口与 host:port 均使用 TCP，绝对路径使用 Unix socket。
+		if _, err := strconv.ParseUint(c.Listen, 10, 16); err == nil {
+			c.Listen = ":" + c.Listen
+		}
+		if _, _, err := net.SplitHostPort(c.Listen); err != nil {
+			return fmt.Errorf("invalid listen address format (use a TCP address or an absolute socket path): %w", err)
 		}
 	}
 
@@ -882,7 +884,7 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
 <p>以上配置支持 Docker Hub、GHCR 和 GCR 的公开镜像；标签必须存在且允许匿名拉取，上游权限、限流和网络错误仍会导致失败。</p>
 
 <h2>可选：前向代理</h2>
-<p>客户端应连接本服务的 HTTP 代理端口（默认 8888）。请将下例中的 proxy.example.com 替换为代理服务器地址。</p>
+<p>前向代理需要将 listen 配置为 TCP 地址（例如 :8888）；Unix socket 模式不开放 TCP 端口。请将下例中的 proxy.example.com:8888 替换为实际代理地址。</p>
 <pre>curl -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/</pre>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
 <pre>{
@@ -1233,13 +1235,6 @@ func main() {
 		log.SetFlags(log.LstdFlags)
 	}
 
-	// 设置监听地址
-	listenAddr := ":8080"
-	if cfg != nil && cfg.Listen != "" {
-		listenAddr = cfg.Listen
-	}
-	log.Printf("将使用监听地址: %s", listenAddr)
-
 	// 构建允许的主机模式
 	allowed := buildAllowedPatterns(cfg)
 	log.Printf("已配置 %d 个允许的主机模式", len(allowed))
@@ -1263,7 +1258,6 @@ func main() {
 	// 创建代理处理器和服务器
 	handler := newProxyHandler(allowed, display, insecure, level, cfg)
 	srv := &http.Server{
-		Addr:              listenAddr,
 		Handler:           logMiddleware(level, handler),
 		ReadHeaderTimeout: 30 * time.Second,
 		ReadTimeout:       cfg.Security.RequestTimeout,
@@ -1276,46 +1270,30 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 在单独的 goroutine 中启动 TCP 服务器
+	// 根据 listen 创建唯一监听器。
+	var listener net.Listener
+	listenerType := "TCP"
+	if filepath.IsAbs(cfg.Listen) {
+		listenerType = "Unix socket"
+		listener, err = listenUnix(cfg.Listen)
+	} else {
+		listener, err = net.Listen("tcp", cfg.Listen)
+	}
+	if err != nil {
+		log.Fatalf("无法创建 %s 监听器: %v", listenerType, err)
+	}
+	defer listener.Close()
+	if listenerType == "Unix socket" {
+		if err := os.Chmod(cfg.Listen, 0666); err != nil {
+			log.Printf("警告: 无法设置 socket 文件权限: %v", err)
+		}
+	}
+	log.Printf("Container Registry Mirrors 正在监听 %s %s", listenerType, listener.Addr())
 	go func() {
-		// 启动 TCP 服务器
-		log.Printf("Container Registry Mirrors 正在监听 TCP %s", listenAddr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("TCP 服务器错误: %v", err)
+		if err := srv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("服务器错误: %v", err)
 		}
 	}()
-
-	// 如果配置了 Unix socket，启动 Unix socket 服务器
-	var socketSrv *http.Server
-	if cfg.SocketPath != "" {
-		socketSrv = &http.Server{
-			Handler:           logMiddleware(level, handler),
-			ReadHeaderTimeout: 30 * time.Second,
-			ReadTimeout:       cfg.Security.RequestTimeout,
-			WriteTimeout:      cfg.Security.RequestTimeout,
-			IdleTimeout:       120 * time.Second,
-			MaxHeaderBytes:    int(globalConfig.Security.MaxHeaderSize),
-		}
-
-		go func() {
-			// 创建 Unix socket 监听器
-			listener, err := listenUnix(cfg.SocketPath)
-			if err != nil {
-				log.Fatalf("无法创建 Unix socket 监听器: %v", err)
-			}
-			defer listener.Close()
-
-			// 设置 socket 文件权限
-			if err := os.Chmod(cfg.SocketPath, 0666); err != nil {
-				log.Printf("警告: 无法设置 socket 文件权限: %v", err)
-			}
-
-			log.Printf("Container Registry Mirrors 正在监听 Unix socket %s", cfg.SocketPath)
-			if err := socketSrv.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				log.Fatalf("Unix socket 服务器错误: %v", err)
-			}
-		}()
-	}
 
 	// 等待中断信号
 	<-ctx.Done()
@@ -1325,16 +1303,9 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	// 优雅关闭 TCP 服务器
+	// 优雅关闭服务器
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("TCP 服务器关闭出错: %v", err)
-	}
-
-	// 优雅关闭 Unix socket 服务器（如果存在）
-	if socketSrv != nil {
-		if err := socketSrv.Shutdown(shutdownCtx); err != nil {
-			log.Printf("Unix socket 服务器关闭出错: %v", err)
-		}
+		log.Printf("服务器关闭出错: %v", err)
 	}
 
 	log.Println("服务器已安全关闭")
