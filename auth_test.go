@@ -454,7 +454,7 @@ func TestAuthChallengePreservesHealth(t *testing.T) {
 func TestAuthPublicEndpoints(t *testing.T) {
 	base := testProxyHandler(t)
 	enableTestAuth(t, base)
-	globalConfig.AllowedHosts = []string{"private-registry.internal.invalid"}
+	globalConfig.AllowedHosts = []string{"custom-registry.example", "CUSTOM-REGISTRY.EXAMPLE", "^registry<test>\\.example$"}
 	p := newProxyHandler(buildAllowedPatterns(globalConfig), false, 0, globalConfig)
 	t.Cleanup(p.transport.CloseIdleConnections)
 	oldMetrics := metrics
@@ -466,22 +466,30 @@ func TestAuthPublicEndpoints(t *testing.T) {
 	}
 	assertNoSecrets := func(body string) {
 		t.Helper()
-		for _, secret := range []string{globalConfig.AllowedHosts[0], authTestUser, authTestPassword, "another-secret"} {
+		for _, secret := range []string{authTestUser, authTestPassword, "another-secret"} {
 			if strings.Contains(body, secret) {
-				t.Error("public response disclosed running configuration")
+				t.Error("public response disclosed authentication credentials")
 			}
 		}
 	}
-	// Check rendering separately so a 401 cannot hide configuration disclosure.
+	// Check the configured list directly and through the anonymous HTTP endpoint.
 	page := httptest.NewRecorder()
 	p.serveIndex(page, httptest.NewRequest(http.MethodGet, "/", nil))
 	assertNoSecrets(page.Body.String())
+	for _, item := range []string{"<li>docker.io</li>", "<li>custom-registry.example</li>", `<li>^registry&lt;test&gt;\.example$</li>`} {
+		if strings.Count(page.Body.String(), item) != 1 {
+			t.Errorf("allowlist item %q missing or duplicated", item)
+		}
+	}
+	if strings.Contains(page.Body.String(), "CUSTOM-REGISTRY.EXAMPLE") || strings.Contains(page.Body.String(), "<test>") {
+		t.Error("allowlist was not deduplicated or HTML escaped")
+	}
 	server := httptest.NewServer(logMiddleware(0, p))
 	t.Cleanup(server.Close)
 	client := server.Client()
 	client.Timeout = 3 * time.Second
 	for _, endpoint := range []struct{ path, contentType, content string }{
-		{"/", "text/html", "Container Registry Mirrors"},
+		{"/", "text/html", "<li>custom-registry.example</li>"},
 		{"/healthz", "application/json", `"status": "healthy"`},
 		{"/metrics", "text/plain", "total_requests "},
 	} {

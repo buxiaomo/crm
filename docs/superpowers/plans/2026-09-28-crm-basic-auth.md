@@ -85,3 +85,15 @@
 - 最终 `go test -race -count=1 ./...` 通过（5.356s）；`go vet ./...`、`go build -o /tmp/crm-public-endpoints-verified .`、`git diff --check` 通过。使用 `/tmp/crm-basic-auth-agent-gocache` 构建缓存。
 - 用户已有的 config.yaml 内容哈希与修改前一致，不纳入本次提交。
 - 两项独立只读审查均通过：认证边界及代理路由无旁路，页面、测试和文档范围一致。
+
+## 任务 4：恢复首页实际仓库白名单（用户明确要求）
+
+用户要求恢复白名单展示；任务 3 的隐藏列表决策被撤回，三个 GET 公开及其他入口认证保持不变。
+
+- [x] 修改 TestAuthPublicEndpoints：默认/自定义白名单须显示，重复项去重，HTML 特殊字符转义；只把账号密码作为秘密断言，保留本地 HTTP E2E 和后续拉取拒绝断言。
+- [x] 运行目标测试观察列表缺失的 RED；恢复 allowedDisplay 和列表渲染，直接复用构造函数已有 cfg，不重加冗余参数或更改认证流程。
+- [x] 更新 README、首页和当前中文设计；全量测试、vet及独立只读复核后提交。
+
+自查：仅恢复展示行为，不加开关、双版本首页、新依赖或权限逻辑；使用标准库 HTML 转义。保留用户未提交的 config.yaml。
+
+验证记录：基线 `go test ./...` 通过（3.413s）；恢复展示测试先因列表缺失失败，随后 `go test -run TestAuthPublicEndpoints -count=1 .` 通过（0.663s，含直接渲染及本地 HTTP E2E）。全量 `go test -race -count=1 ./...`、`go vet ./...` 和 `git diff --check` 通过。独立只读审查通过，确认 auth.go 与路由未改；用户 config.yaml 内容哈希保持不变。本地提交，不推送。

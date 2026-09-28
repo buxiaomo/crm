@@ -9,7 +9,7 @@
 - 新增可选 `auth.users` 映射：用户名到密码；省略 `auth`（或 null）保持旧行为。显式 `auth: {}` 或空 users、空用户名/密码、用户名含冒号、账号密码含控制字符均拒绝启动，错误不包含凭据。
 - 配置文件仅对服务账号可读（建议 0600）；修改账号后重启。示例只使用占位密码，不设置 admin/admin 默认凭据。
 - `ProxyHandler.ServeHTTP` 在并发限流和路由之前认证，保护 mirror、普通代理及 CONNECT。仅普通 origin-form 的 GET /、GET /healthz、GET /metrics 精确豁免；HEAD/POST、编码变体、其他路径及 absolute-form/CONNECT 不豁免。
-- 首页只返回静态说明，不展示实际 allowed_hosts 或其他运行配置。metrics/healthz 公开聚合统计与健康状态（含请求量、流量、错误、连接和运行时间），用户已知悉此信息可见性；仍保留并发及请求限制。
+- 首页展示使用说明及默认仓库和配置 allowed_hosts 的实际白名单（去重、HTML 转义），不展示账号密码。metrics/healthz 公开聚合统计与健康状态（含请求量、流量、错误、连接和运行时间），用户已知悉此信息可见性；仍保留并发及请求限制。
 - 除上述公开读接口，普通服务请求用 Authorization，失败返回 401 和 `WWW-Authenticate: Basic realm="CRM", charset="UTF-8"`；absolute-form 代理及 CONNECT 用 Proxy-Authorization，失败返回 407 和同格式 Proxy-Authenticate。缺少、重复、畸形、错误凭据均拒绝，不访问上游。
 - 正常 401/407 认证挑战不计入服务故障错误率，避免健康检查误报。
 - 使用 Go 标准库 BasicAuth 解析和 SHA-256 定长摘要的 constant-time 比较。无账号数据库、会话、JWT、token 缓存和新依赖。
@@ -25,7 +25,7 @@
 
 ## 验证
 
-配置表测试覆盖 YAML/JSON、启用边界与无秘密错误；入口表测试覆盖公开路径的精确豁免及其余入口的 401/407、重复头；本地网络 E2E 验证公开接口不泄漏配置且不会授权后续拉取；真实本地 HTTP/TLS E2E 覆盖 URL userinfo、Hub/GHCR token/registry/CDN、HEAD/GET、摘要、成功后未认证请求仍被拒绝、前向代理与 CONNECT。日志回归确保 URL/认证头不泄漏。运行全量 Go 测试、race 与 vet；外部 Docker/CRI 拉取与线上部署分开报告。
+配置表测试覆盖 YAML/JSON、启用边界与无秘密错误；入口表测试覆盖公开路径的精确豁免及其余入口的 401/407、重复头；本地网络 E2E 验证首页展示白名单、公开接口不泄漏账号密码且不会授权后续拉取；真实本地 HTTP/TLS E2E 覆盖 URL userinfo、Hub/GHCR token/registry/CDN、HEAD/GET、摘要、成功后未认证请求仍被拒绝、前向代理与 CONNECT。日志回归确保 URL/认证头不泄漏。运行全量 Go 测试、race 与 vet；外部 Docker/CRI 拉取与线上部署分开报告。
 
 ## 取舍复核
 
