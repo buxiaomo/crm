@@ -81,3 +81,13 @@
 - [x] Python tomllib 已解析全部 4 个 TOML 示例并检查目标 registry/插件路径；只读文档复核通过，补充 1.5+ 支持边界、2.x/v2 配置兼容及显式 CRI image endpoint。
 
 自查：只增加客户端配置说明；不为旧例中的 gcr.io 扩展服务端，不增加测试框架或重复运行无关 E2E。
+
+
+## 后续补充：首页展示 Containerd 配置
+
+用户澄清配置须放入 `main.go` 的 GET `/` HTML，而非仅在 README 中。
+复用首页现有静态 HTML，增加与 README 一致的 Containerd 1.x/2.x、hosts、旧式兼容配置和验证命令。
+不引入模板或依赖，不修改加速器协议。
+
+- [x] 在 Docker 加速说明后插入 Containerd 加速区块。
+- [x] 临时服务真实 GET `/` 返回 200 和 HTML；4 份 TOML 及 2 组 shell 命令解析通过，临时服务已关闭。`go test ./...` 和 `make build` 通过。

@@ -796,6 +796,40 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 <p>将域名替换为你的 HTTPS 入口，重启 Docker 后执行 docker pull nginx。无需配置客户端 HTTP 代理。</p>
 <p>仅支持 Docker Hub 公开镜像的只读拉取，仍受上游匿名额度限制；不支持私有仓库或镜像推送。</p>
 
+<h2>Containerd 镜像加速</h2>
+<p>Kubernetes / CRI 客户端在 <code>/etc/containerd/config.toml</code> 中启用 hosts 配置目录。按现有配置版本合并以下片段，保留其余配置。</p>
+<p>Containerd 1.5+ 的 1.x 版本（配置版本 2）：</p>
+<pre><code>version = 2
+
+[plugins."io.containerd.grpc.v1.cri".registry]
+  config_path = "/etc/containerd/certs.d"</code></pre>
+<p>Containerd 2.x（配置版本 3）：</p>
+<pre><code>version = 3
+
+[plugins."io.containerd.cri.v1.images".registry]
+  config_path = "/etc/containerd/certs.d"</code></pre>
+<p><code>version</code> 是文件顶层字段。Containerd 2.x 若仍使用配置版本 2，可沿用第一种插件路径；不要只改版本号而保留不匹配的插件配置。</p>
+<p>创建 <code>/etc/containerd/certs.d/docker.io/hosts.toml</code>：</p>
+<pre><code>server = "https://registry-1.docker.io"
+
+[host."https://mirrors.xiaomo.site"]
+  capabilities = ["pull", "resolve"]</code></pre>
+<p>将域名替换为自己信任的 CRM 入口；<code>resolve</code> 允许其解析 tag 对应的 digest。加速器失败时会回退 Docker Hub；如需禁止直连回退，将 <code>server</code> 也改为 <code>https://mirrors.xiaomo.site</code>。</p>
+<p>修改 <code>config.toml</code> 后重启并通过 CRI 验证；仅修改 <code>hosts.toml</code> 无需重启：</p>
+<pre><code>sudo systemctl restart containerd
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
+  --image-endpoint unix:///run/containerd/containerd.sock \
+  pull docker.io/library/nginx:latest</code></pre>
+<p>单独使用 <code>ctr</code> 时须显式传入 hosts 目录，它不读取 CRI 插件的 mirror 配置：</p>
+<pre><code>sudo ctr images pull --hosts-dir /etc/containerd/certs.d docker.io/library/nginx:latest</code></pre>
+<h3>Containerd 1.x 旧配置兼容</h3>
+<pre><code>version = 2
+
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["https://mirrors.xiaomo.site"]</code></pre>
+<p>旧式 CRI 配置已弃用，不与非空 <code>config_path</code> 混用；新部署使用 <code>hosts.toml</code>。修改后重启并使用上面的 <code>crictl</code> 命令验证。</p>
+<p>以上配置仅加速 Docker Hub 公开镜像，不适用于 <code>gcr.io</code> 等其他仓库。</p>
+
 <h2>兼容前向代理允许的仓库</h2>
 <ul>`)
 	// list displays
