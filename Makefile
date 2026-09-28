@@ -1,6 +1,6 @@
 build:
 	@go mod download
-	@CGO_ENABLED=0 GO111MODULE=on GOOS=linux GOARCH=amd64 go build -o crm main.go
+	@CGO_ENABLED=0 GO111MODULE=on GOOS=linux GOARCH=amd64 go build -o crm .
 
 install:
 	@install -D -m 755 crm /usr/local/bin/crm

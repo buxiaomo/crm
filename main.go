@@ -573,6 +573,12 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Registry mirror clients send origin-form URLs through the HTTPS frontend.
+	if !r.URL.IsAbs() && strings.HasPrefix(r.URL.Path, "/v2/") {
+		p.serveMirror(w, r)
+		return
+	}
+
 	// For normal HTTP proxying, ensure URL is absolute
 	if !r.URL.IsAbs() {
 		atomic.AddInt64(&metrics.ErrorCount, 1)
@@ -780,9 +786,17 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 .muted{color:#666;font-size:13px}
 </style></head><body>
 <h1>Container Registry Mirrors</h1>
-<p class="muted">一个无缓存的前向代理，专为容器镜像 registry 中转：支持 HTTP 代理与 HTTPS CONNECT 隧道。可限制允许的主机。</p>
+<p class="muted">Docker Hub 公开镜像加速器：服务端完成认证和镜像层下载，无磁盘缓存。</p>
 
-<h2>支持的仓库地址</h2>
+<h2>Docker 镜像加速</h2>
+<p>Docker Engine 的 /etc/docker/daemon.json：</p>
+<pre>{
+  "registry-mirrors": ["https://mirrors.xiaomo.site"]
+}</pre>
+<p>将域名替换为你的 HTTPS 入口，重启 Docker 后执行 docker pull nginx。无需配置客户端 HTTP 代理。</p>
+<p>仅支持 Docker Hub 公开镜像的只读拉取，仍受上游匿名额度限制；不支持私有仓库或镜像推送。</p>
+
+<h2>兼容前向代理允许的仓库</h2>
 <ul>`)
 	// list displays
 	shown := make(map[string]struct{})
@@ -800,7 +814,7 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 	}
 	fmt.Fprint(w, `</ul>
 
-<h2>使用方式（前向代理）</h2>
+<h2>可选：前向代理</h2>
 <p>客户端应连接本服务的 HTTP 代理端口（默认 8888）。请将下例中的 proxy.example.com 替换为代理服务器地址。</p>
 <pre>curl -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/</pre>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
@@ -811,7 +825,7 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
   }
 }</pre>
 <p>Containerd：在 containerd 服务的 systemd 配置中设置 HTTP_PROXY 和 HTTPS_PROXY，然后重启服务。</p>
-<p>本服务不提供 Registry mirror API，不能配置为 registry-mirrors 或 containerd registry endpoint。仓库认证及下载重定向域名也需要在白名单中。</p>
+<p>上述代理模式用于兼容其他仓库；其 allowed_hosts 白名单不扩展 Docker Hub 加速器的支持范围。</p>
 
 <footer>
 若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。<br>
