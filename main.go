@@ -831,13 +831,21 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 	fmt.Fprint(w, `</ul>
 
 <h2>Docker 镜像加速</h2>
-<p>以下示例适用于匿名访问；CRM 启用 Basic 认证时，需另外验证 Docker Engine 的认证支持，不能由 curl 成功推断。</p>
+<p>本节仅支持 Docker Hub 公开镜像的只读拉取，仍受上游匿名额度限制；不支持私有仓库或镜像推送。</p>
+<h3>匿名访问</h3>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
 <pre>{
   "registry-mirrors": ["https://mirrors.xiaomo.site"]
 }</pre>
 <p>将域名替换为你的 HTTPS 入口，重启 Docker 后执行 docker pull nginx。无需配置客户端 HTTP 代理。</p>
-<p>仅支持 Docker Hub 公开镜像的只读拉取，仍受上游匿名额度限制；不支持私有仓库或镜像推送。</p>
+<h3>需要账号认证时</h3>
+<p>Docker Engine 不允许在 <code>registry-mirrors</code> URL 中携带用户名和密码。配置 <code>https://用户名:密码@mirrors.xiaomo.site</code> 会被拒绝，报错 <code>username/password not allowed in URI</code>；URL 编码或 Base64 也无法绕过这项限制。</p>
+<p>从 /etc/docker/daemon.json 移除这条无效的 mirror 配置，保留其他配置，再重启 Docker。随后登录 CRM，并在镜像名称中显式指定 CRM 域名：</p>
+<pre>sudo systemctl restart docker
+docker login mirrors.xiaomo.site --username admin
+docker pull mirrors.xiaomo.site/library/tomcat:latest</pre>
+<p>将示例域名和用户名替换为实际值，登录时按提示输入 CRM 账号密码。拉取时必须保留 CRM 域名前缀；仅执行 docker login 不会让 <code>docker pull tomcat</code> 自动使用 CRM 凭据。</p>
+<p>如果需要保持原始镜像名称，使用下文的认证前向代理方式；registry-mirrors 配置无法直接提供这组 CRM Basic 凭据。</p>
 
 <h2>Containerd 镜像加速</h2>
 <p>Kubernetes / CRI 客户端在 /etc/containerd/config.toml 中启用 hosts 配置目录。按现有配置版本合并以下片段，保留其余配置。</p>
