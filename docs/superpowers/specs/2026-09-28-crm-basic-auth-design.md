@@ -22,7 +22,7 @@
 
 - curl 支持 URL userinfo，也可 `curl --user 用户名 URL` 交互输入密码，避免密码进入命令历史。
 - Containerd 使用仅绑定 CRM host 的 `hosts.toml` header.Authorization；不对上游 host 配置该头。Basic 字符串只是 Base64，配置文件同样需要限制读取权限。
-- 不声称 Docker Engine registry-mirrors 支持带账号密码的 URL；普通 curl 成功不能代替真实运行时验证。
+- Docker Engine 的 registry-mirrors 拒绝带账号密码的 URL。首页 Docker 章节分别说明匿名 mirror 配置和需要账号时的显式仓库用法：移除无效 mirror 条目后，docker login CRM 域名，再以 CRM 域名/library/镜像名拉取 Docker Hub 公开镜像。仅登录 CRM 不会给原始 Hub 镜像名自动附加 CRM 凭据；保留原始名称需采用认证前向代理。此处为客户端说明，不展示服务端账号配置。
 - HTTPS 由现有 Nginx/Caddy 终止；CRM 的裸 HTTP 端口只用于可信内网或本机，外部必须经过 HTTPS。认证配置不会自动改变部署，也不让公开上游镜像变成私有仓库镜像。
 
 ## 验证
