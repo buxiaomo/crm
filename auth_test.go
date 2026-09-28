@@ -536,3 +536,82 @@ func TestAuthPublicEndpoints(t *testing.T) {
 		t.Errorf("public index bypassed concurrency limit: status=%d", busy.Code)
 	}
 }
+
+func TestIndexAuthStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name, config string
+		enabled      bool
+	}{
+		{"omitted", "listen: ':8888'\n", false},
+		{"null", "listen: ':8888'\nauth: null\n", false},
+		{"enabled", "listen: ':8888'\nauth:\n  users:\n    status-user-private: status-password-private\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "status.yaml")
+			if err := os.WriteFile(path, []byte(tc.config), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfigFrom(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			base := testProxyHandler(t)
+			globalConfig = cfg
+			p := newProxyHandler(base.allowedPatterns, false, 0, cfg)
+			t.Cleanup(p.transport.CloseIdleConnections)
+			page := httptest.NewRecorder()
+			p.serveIndex(page, httptest.NewRequest(http.MethodGet, "/", nil))
+			server := httptest.NewServer(logMiddleware(0, p))
+			t.Cleanup(server.Close)
+			client := server.Client()
+			client.Timeout = 3 * time.Second
+			resp, err := client.Get(server.URL + "/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("WWW-Authenticate") != "" {
+				t.Errorf("anonymous index status=%d challenge=%q", resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
+			}
+			want := []string{"未开启认证：镜像加速允许匿名访问"}
+			unwanted := []string{"已开启认证", "未授权无法使用镜像加速，请先配置客户端认证"}
+			if tc.enabled {
+				want, unwanted = unwanted, want
+			}
+			unwanted = append(unwanted, "status-user-private", "status-password-private", "auth.users", "auth:", "users:", "REPLACE_WITH_A_STRONG_PASSWORD")
+			for _, rendered := range []struct{ name, body string }{
+				{"direct", page.Body.String()}, {"http", string(body)},
+			} {
+				for _, text := range want {
+					if !strings.Contains(rendered.body, text) {
+						t.Errorf("%s index missing authentication state %q", rendered.name, text)
+					}
+				}
+				for _, text := range unwanted {
+					if strings.Contains(rendered.body, text) {
+						t.Errorf("%s index disclosed credentials/configuration or displayed the opposite state", rendered.name)
+					}
+				}
+			}
+			resp, err = client.Get(server.URL + "/v2/")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			wantStatus := http.StatusOK
+			if tc.enabled {
+				wantStatus = http.StatusUnauthorized
+			}
+			if resp.StatusCode != wantStatus {
+				t.Errorf("anonymous mirror status=%d after index, want %d", resp.StatusCode, wantStatus)
+			}
+		})
+	}
+}
