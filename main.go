@@ -807,9 +807,9 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 <h1>Container Registry Mirrors</h1>
 <p class="muted">公开镜像加速器：Docker Hub 与 Containerd 白名单内多仓库拉取，服务端完成认证和下载，无磁盘缓存。</p>`)
 	if p.auth != nil {
-		fmt.Fprint(w, `<p class="auth-notice"><strong>认证已开启</strong>：未授权无法使用镜像加速，请先配置客户端认证。</p>`)
+		fmt.Fprint(w, `<p class="auth-notice"><strong>已开启认证</strong>：未授权无法使用镜像加速，请先配置客户端认证。</p>`)
 	} else {
-		fmt.Fprint(w, `<p class="muted">认证未开启：镜像加速允许匿名访问。</p>`)
+		fmt.Fprint(w, `<p class="muted">未开启认证：镜像加速允许匿名访问。</p>`)
 	}
 	fmt.Fprint(w, `
 

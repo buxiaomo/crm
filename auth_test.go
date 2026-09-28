@@ -580,8 +580,8 @@ func TestIndexAuthStatus(t *testing.T) {
 			if resp.StatusCode != http.StatusOK || resp.Header.Get("WWW-Authenticate") != "" {
 				t.Errorf("anonymous index status=%d challenge=%q", resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
 			}
-			want := []string{"认证未开启：镜像加速允许匿名访问"}
-			unwanted := []string{"认证已开启", "未授权无法使用镜像加速，请先配置客户端认证"}
+			want := []string{"未开启认证：镜像加速允许匿名访问"}
+			unwanted := []string{"已开启认证", "未授权无法使用镜像加速，请先配置客户端认证"}
 			if tc.enabled {
 				want, unwanted = unwanted, want
 			}
