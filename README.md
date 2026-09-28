@@ -1,11 +1,41 @@
 # Container Registry Mirrors
 
-一个无缓存的前向代理，专为容器镜像 registry 中转：支持 HTTP 代理与 HTTPS CONNECT 隧道。可限制允许的主机，默认包含：
+一个无缓存的 Docker Hub 公开镜像加速器，支持 `registry-mirrors`，并兼容 HTTP 前向代理与 HTTPS CONNECT 隧道。前向代理可限制允许的主机，默认包含：
 
 - docker.io / registry-1.docker.io / auth.docker.io / production.cloudfront.docker.com
 - gcr.io
 - k8s.io / registry.k8s.io
 - docker.elastic.co / ghcr.io
+
+## Docker 镜像加速器（推荐）
+
+将以下配置合并到客户端的 `/etc/docker/daemon.json`：
+
+```json
+{
+  "registry-mirrors": ["https://mirrors.xiaomo.site"]
+}
+```
+
+`mirrors.xiaomo.site` 应指向部署了 CRM 的 HTTPS 入口，镜像名称保持不变：
+
+```bash
+sudo systemctl restart docker
+docker pull nginx
+```
+
+客户端无需配置 HTTP/HTTPS 代理，也无需启用 MITM。
+服务端获取匿名 `pull` 令牌，并跟随允许的 blob CDN 跳转后流式返回。
+这部分认证和下载不要求客户端直连 `auth.docker.io` 或 CDN。
+
+- 仅支持 Docker Hub 公开镜像的只读拉取，不支持推送、私仓或多仓库 mirror。
+- 不缓存镜像或令牌；每次资源请求重新获取令牌，增加一次认证往返。
+  服务端承担下载流量和 Docker Hub 匿名额度，客户端登录凭证不会转发。
+- 清单内容保持原样；清单内的外部 `urls` / foreign layer 下载不在支持保证内。
+
+Docker Desktop 可在 Docker Engine 设置中合并相同 JSON 后应用。
+参见 [Docker mirror 文档](https://docs.docker.com/docker-hub/image-library/mirror/)。
+Containerd mirror 配置见[官方文档](https://github.com/containerd/containerd/blob/main/docs/hosts.md)。
 
 ## 运行
 
@@ -40,8 +70,8 @@ go build -o crm
 
 配置项说明：
 - `listen`: 监听地址，例如 `:8888`
-- `socket_path`: 可选 Unix socket 路径，例如 `/tmp/crm.sock`；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
-- `allowed_hosts`: 在默认白名单基础上追加允许代理的主机，支持正则表达式（不区分大小写）。
+- `socket_path`: 可选 Unix socket 路径，例如 `/run/crm.sock`；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
+- `allowed_hosts`: 在默认白名单基础上追加前向代理主机，支持正则表达式（不区分大小写）；不改变 mirror 的固定 Hub/CDN 范围。
   - 普通域名按“精确匹配”处理，例如 `docker.io`；点号不会触发正则匹配，也不会自动放行子域名。
   - 使用正则元字符时按正则匹配，例如 `^.*\.k8s\.io$` 匹配所有以 `.k8s.io` 结尾的域名。
 - `insecure_tls`: 上游 TLS 是否跳过证书校验（默认 false）
@@ -55,9 +85,9 @@ go build -o crm
 - `security.max_header_size`: HTTP 入口请求头上限（字节）。
 - `security.max_concurrent_reqs`: 最大并发 HTTP 请求或 CONNECT 隧道数。
 
-## 使用示例
+## 前向代理使用示例（兼容可选）
 
-本服务是**前向代理**，客户端需要连接代理服务器的 HTTP 端口。它不提供 Registry mirror API，不能填入 Docker 的 `registry-mirrors` 或 Containerd 的 registry endpoint。
+需要前向代理或访问其他 registry 时，可使用以下兼容配置，客户端连接代理服务器的 HTTP 端口。Docker Hub 镜像加速请优先使用上面的 `registry-mirrors` 配置。
 
 下例中的 `proxy.example.com:8888` 应替换为实际代理地址；同机运行可使用 `127.0.0.1:8888`。
 
@@ -112,9 +142,13 @@ sudo systemctl restart containerd
 
 拉取镜像会访问认证服务器及下载重定向地址。这些地址也必须在 `allowed_hosts` 中；按实际仓库添加精确域名或带边界的正则，避免使用无限制通配。Docker 的相关域名可参考[官方白名单](https://docs.docker.com/desktop/setup/allow-list/)。
 
-仓库中的 `Caddy` 和 `nginx.conf` 用于展示首页、健康检查和指标；普通 HTTP 反向代理配置不能替代支持 CONNECT 的前向代理。Docker/Containerd 应连接 CRM 的 `8888` 端口。示例 Unix socket 路径统一为 `/tmp/crm.sock`。
+仓库中的 `Caddy` 和 `nginx.conf` 提供 mirror API、首页、健康检查和指标入口；`registry-mirrors` 指向该 HTTPS 域名。示例与 `config.yaml` 统一使用 `/run/crm.sock`，目录须存在且服务用户可写，反向代理用户须能访问 socket。nginx 示例关闭响应缓冲，避免镜像层写入临时文件。
+
+这些普通反向代理配置不提供 CONNECT 隧道；使用前向代理的 Docker/Containerd 客户端仍应连接 CRM 的 `8888` 端口。
 
 ## MITM 模式
+
+镜像加速器不需要 MITM；以下仅用于前向代理调试。
 
 MITM（中间人）模式允许代理解密 HTTPS 流量，用于调试和分析容器镜像拉取过程中的问题。携带请求体的 MITM 请求在响应后关闭隧道，后续请求重新建连；无请求体的请求仍可复用连接。
 
@@ -204,3 +238,31 @@ docker pull nginx:latest
 ## 健康检查
 
 HTTP `GET /healthz` 返回 JSON 状态：正常时为 `200`，高负载或累计错误率过高时为 `503`。`GET /metrics` 返回文本指标。
+
+## 开发验证
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+make build
+```
+
+`make build` 生成 Linux amd64 二进制；本机运行请使用上面的 `go build`。
+
+### 隔离 Docker 拉取 E2E
+
+`tests/e2e-mirror.sh` 需要可用的 Docker CLI/daemon 和 `--privileged` dind 容器支持。
+默认使用 `docker:29-dind`，宿主 Docker 须已具备或能够拉取该镜像。
+先启动本机 CRM，使其 TCP 端口可经 `host.docker.internal` 访问
+（例如 `listen: ":8888"`），且 CRM 可访问 Hub 认证、Registry 和 CDN。
+
+```bash
+MIRROR_URL=http://host.docker.internal:8888 bash tests/e2e-mirror.sh
+```
+
+`MIRROR_URL` 必须使用 `http(s)://host.docker.internal[:port]`，不带路径或凭证。
+可用 `DIND_IMAGE` / `TEST_IMAGE` 覆盖镜像，默认测试 `nginx:latest`。
+Docker 可能在 mirror 失败后回退直连，因此脚本先以坏 mirror 和黑洞出口代理做阴性对照，
+再用全新 dind 容器验证 CRM 拉取及摘要，避免“拉取成功”掩盖回退。
+脚本不修改宿主 daemon 配置，不暴露 dind API；结束后清理容器和网络并保留日志。

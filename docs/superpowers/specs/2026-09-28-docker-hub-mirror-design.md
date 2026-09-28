@@ -16,7 +16,7 @@
 - GET/HEAD `/v2/<repository>/manifests/<reference>`、`/v2/<repository>/blobs/<digest>` 转发到固定 `https://registry-1.docker.io`；原样保留内容、摘要、类型、长度、Range 和条件请求语义。
 - `ns` 缺省、`docker.io`、`registry-1.docker.io` 可接受，转发前移除；其他或重复 namespace 拒绝。拒绝写方法和非拉取 API。
 - 每个资源请求由服务端到固定 `https://auth.docker.io/token` 取得匿名 `repository:<repository>:pull` 令牌；不缓存令牌。禁止将客户端 Authorization、Cookie、代理凭证转发到上游。
-- CDN 重定向由服务端跟随并流式返回；最多 10 跳，只允许 HTTPS、默认/443 端口、无 userinfo、已配置白名单域名。跨域去掉 Authorization，拒绝未放行的跳转。
+- CDN 重定向由服务端跟随并流式返回；最多 10 跳，只允许 HTTPS、默认/443 端口、无 userinfo、固定 Docker Hub/CDN 白名单域名（独立于前向代理 allowed_hosts）。跨域去掉 Authorization，拒绝未放行的跳转。
 - 上游 401/403/404/429/5xx 保留状态，剥离 WWW-Authenticate，避免客户端因认证挑战绕过加速器；连接/令牌解析错误返回 502。
 - 不修改 manifest 字节，因此外部 foreign-layer URL 不在此次下载保证内；验收以标准 Linux Docker Hub 镜像为准。
 
