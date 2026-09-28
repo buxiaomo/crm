@@ -35,7 +35,77 @@ docker pull nginx
 
 Docker Desktop 可在 Docker Engine 设置中合并相同 JSON 后应用。
 参见 [Docker mirror 文档](https://docs.docker.com/docker-hub/image-library/mirror/)。
-Containerd mirror 配置见[官方文档](https://github.com/containerd/containerd/blob/main/docs/hosts.md)。
+
+## Containerd 镜像加速器
+
+Kubernetes / CRI 客户端先在 `/etc/containerd/config.toml` 中启用 hosts 配置目录。
+按现有配置版本合并对应片段，保留其余配置；`version` 是文件顶层字段。
+
+Containerd 1.5+ 的 1.x 版本（配置版本 2）：
+
+```toml
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri".registry]
+  config_path = "/etc/containerd/certs.d"
+```
+
+Containerd 2.x（配置版本 3）：
+
+```toml
+version = 3
+
+[plugins."io.containerd.cri.v1.images".registry]
+  config_path = "/etc/containerd/certs.d"
+```
+
+Containerd 2.x 若仍使用配置版本 2，可沿用第一种插件路径；
+不要只改顶层 `version` 而保留不匹配的插件配置。
+
+创建 `/etc/containerd/certs.d/docker.io/hosts.toml`：
+
+```toml
+server = "https://registry-1.docker.io"
+
+[host."https://mirrors.xiaomo.site"]
+  capabilities = ["pull", "resolve"]
+```
+
+这里的域名应是自己信任的 CRM 入口；`resolve` 允许其解析 tag 对应的 digest。
+上例在加速器失败时会回退 Docker Hub；如需禁止直连回退，
+将 `server` 也改为 `https://mirrors.xiaomo.site`。
+修改 `config.toml` 后重启 Containerd，并通过 CRI 验证：
+
+```bash
+sudo systemctl restart containerd
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
+  --image-endpoint unix:///run/containerd/containerd.sock \
+  pull docker.io/library/nginx:latest
+```
+
+仅修改 `hosts.toml` 无需重启。
+单独使用 `ctr` 时，须显式传入 hosts 目录，它不读取 CRI 插件的 mirror 配置：
+
+```bash
+sudo ctr images pull --hosts-dir /etc/containerd/certs.d docker.io/library/nginx:latest
+```
+
+### Containerd 1.x 旧配置兼容
+
+提交 `9644e9d` 删除的旧式配置可用于仍采用该机制的 Containerd 1.x：
+
+```toml
+version = 2
+
+[plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
+  endpoint = ["https://mirrors.xiaomo.site"]
+```
+
+这套 CRI 配置已弃用，不与上面的非空 `config_path` 混用；新部署使用 `hosts.toml`。
+修改后重启 Containerd，使用上面的 `crictl` 命令验证。
+旧示例中的 `gcr.io` 不适用：当前 CRM 加速器仅支持 Docker Hub 公开镜像。
+详见 [Containerd hosts 配置](https://github.com/containerd/containerd/blob/main/docs/hosts.md)
+和 [1.7 旧式配置说明](https://github.com/containerd/containerd/blob/release/1.7/docs/cri/registry.md)。
 
 ## 运行
 

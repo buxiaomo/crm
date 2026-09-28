@@ -69,3 +69,15 @@
 - 协议/测试方案分别经子 agent 调研，最终独立只读代码审查通过，无重要遗留问题。
 - 设计裁定：CDN 使用独立固定域名名单，不复用前向代理的其他 registry 白名单；代价是上游新增 CDN 时需根据证据更新。
 - 未验证边界：未部署线上 Caddy/nginx HTTPS；未测私仓及 foreign layer（不在支持范围）。测试容器和网络由脚本清理，宿主 Docker 原配置未修改。
+
+
+## 后续补充：Containerd 客户端配置
+
+用户要求补充提交 `9644e9d` 涉及的 Containerd 配置；该提交删除的是旧式 mirror，代理环境变量示例已保留。
+本次只补 README，保留 Docker Hub 范围；不修改服务实现，也不新增运行环境。
+
+- [x] 核对提交前后差异及 Containerd 官方 hosts/1.7 CRI 文档。
+- [x] 增加 1.x/2.x 的 config_path、hosts.toml、crictl/ctr 验证命令及旧式兼容片段。
+- [x] Python tomllib 已解析全部 4 个 TOML 示例并检查目标 registry/插件路径；只读文档复核通过，补充 1.5+ 支持边界、2.x/v2 配置兼容及显式 CRI image endpoint。
+
+自查：只增加客户端配置说明；不为旧例中的 gcr.io 扩展服务端，不增加测试框架或重复运行无关 E2E。
