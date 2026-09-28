@@ -1,6 +1,6 @@
 # Container Registry Mirrors
 
-一个无缓存的 Docker Hub 公开镜像加速器，支持 `registry-mirrors`，并兼容 HTTP 前向代理与 HTTPS CONNECT 隧道。前向代理可限制允许的主机，默认包含：
+一个无缓存的公开镜像加速器，支持 Docker Hub `registry-mirrors` 和 Containerd 白名单内多仓库 mirror，并兼容 HTTP 前向代理与 HTTPS CONNECT 隧道。默认允许的主机包含：
 
 - docker.io / registry-1.docker.io / auth.docker.io / production.cloudfront.docker.com
 - gcr.io
@@ -28,7 +28,7 @@ docker pull nginx
 服务端获取匿名 `pull` 令牌，并跟随允许的 blob CDN 跳转后流式返回。
 这部分认证和下载不要求客户端直连 `auth.docker.io` 或 CDN。
 
-- 仅支持 Docker Hub 公开镜像的只读拉取，不支持推送、私仓或多仓库 mirror。
+- Docker Engine 的 `registry-mirrors` 仅用于 Docker Hub；Containerd 的多仓库配置见下节。仅支持公开镜像只读拉取，不支持推送或私仓。
 - 不缓存镜像或令牌；每次资源请求重新获取令牌，增加一次认证往返。
   服务端承担下载流量和 Docker Hub 匿名额度，客户端登录凭证不会转发。
 - 清单内容保持原样；清单内的外部 `urls` / foreign layer 下载不在支持保证内。
@@ -74,6 +74,33 @@ server = "https://registry-1.docker.io"
 这里的域名应是自己信任的 CRM 入口；`resolve` 允许其解析 tag 对应的 digest。
 上例在加速器失败时会回退 Docker Hub；如需禁止直连回退，
 将 `server` 也改为 `https://mirrors.xiaomo.site`。
+
+GHCR 与 GCR 使用同一个 CRM 地址，分别创建以下文件：
+
+`/etc/containerd/certs.d/ghcr.io/hosts.toml`：
+
+```toml
+server = "https://ghcr.io"
+
+[host."https://mirrors.xiaomo.site"]
+  capabilities = ["pull", "resolve"]
+```
+
+`/etc/containerd/certs.d/gcr.io/hosts.toml`：
+
+```toml
+server = "https://gcr.io"
+
+[host."https://mirrors.xiaomo.site"]
+  capabilities = ["pull", "resolve"]
+```
+
+Containerd 自动附加 `?ns=ghcr.io` 或 `?ns=gcr.io`，CRM 在白名单内选择上游；
+无 `ns` 时仍使用 Docker Hub。仓库地址仅支持 HTTPS 默认端口或 443。
+CRM 在服务端处理匿名 Bearer 认证和下载跳转，不转发客户端凭证。
+GHCR 下载域名 `pkg-containers.githubusercontent.com` 已内置；其他仓库的认证/CDN 域名
+如未放行，需在 CRM 的 `allowed_hosts` 中添加精确域名或带边界的正则。
+
 修改 `config.toml` 后重启 Containerd，并通过 CRI 验证：
 
 ```bash
@@ -81,6 +108,12 @@ sudo systemctl restart containerd
 sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
   --image-endpoint unix:///run/containerd/containerd.sock \
   pull docker.io/library/nginx:latest
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
+  --image-endpoint unix:///run/containerd/containerd.sock \
+  pull ghcr.io/buxiaomo/kubeasy:v1.34.12
+sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
+  --image-endpoint unix:///run/containerd/containerd.sock \
+  pull gcr.io/distroless/static:nonroot
 ```
 
 仅修改 `hosts.toml` 无需重启。
@@ -103,7 +136,7 @@ version = 2
 
 这套 CRI 配置已弃用，不与上面的非空 `config_path` 混用；新部署使用 `hosts.toml`。
 修改后重启 Containerd，使用上面的 `crictl` 命令验证。
-旧示例中的 `gcr.io` 不适用：当前 CRM 加速器仅支持 Docker Hub 公开镜像。
+其他白名单仓库可使用对应仓库名称配置同一 endpoint，推荐使用上面的 `hosts.toml`。
 详见 [Containerd hosts 配置](https://github.com/containerd/containerd/blob/main/docs/hosts.md)
 和 [1.7 旧式配置说明](https://github.com/containerd/containerd/blob/release/1.7/docs/cri/registry.md)。
 
@@ -141,7 +174,7 @@ go build -o crm
 配置项说明：
 - `listen`: 监听地址，例如 `:8888`
 - `socket_path`: 可选 Unix socket 路径，例如 `/run/crm.sock`；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
-- `allowed_hosts`: 在默认白名单基础上追加前向代理主机，支持正则表达式（不区分大小写）；不改变 mirror 的固定 Hub/CDN 范围。
+- `allowed_hosts`: 在默认白名单基础上追加前向代理及非 Hub mirror 的仓库、认证和下载主机，支持正则表达式（不区分大小写）；Hub mirror 保留固定认证/CDN 范围。
   - 普通域名按“精确匹配”处理，例如 `docker.io`；点号不会触发正则匹配，也不会自动放行子域名。
   - 使用正则元字符时按正则匹配，例如 `^.*\.k8s\.io$` 匹配所有以 `.k8s.io` 结尾的域名。
 - `insecure_tls`: 上游 TLS 是否跳过证书校验（默认 false）
@@ -157,7 +190,7 @@ go build -o crm
 
 ## 前向代理使用示例（兼容可选）
 
-需要前向代理或访问其他 registry 时，可使用以下兼容配置，客户端连接代理服务器的 HTTP 端口。Docker Hub 镜像加速请优先使用上面的 `registry-mirrors` 配置。
+需要前向代理时，可使用以下兼容配置，客户端连接代理服务器的 HTTP 端口。Docker Hub 镜像加速请优先使用上面的 `registry-mirrors` 配置。
 
 下例中的 `proxy.example.com:8888` 应替换为实际代理地址；同机运行可使用 `127.0.0.1:8888`。
 
@@ -336,3 +369,18 @@ MIRROR_URL=http://host.docker.internal:8888 bash tests/e2e-mirror.sh
 Docker 可能在 mirror 失败后回退直连，因此脚本先以坏 mirror 和黑洞出口代理做阴性对照，
 再用全新 dind 容器验证 CRM 拉取及摘要，避免“拉取成功”掩盖回退。
 脚本不修改宿主 daemon 配置，不暴露 dind API；结束后清理容器和网络并保留日志。
+
+### 隔离 Containerd / CRI 多仓库 E2E
+
+`tests/e2e-containerd-mirror.sh` 使用独立的 privileged Alpine 容器安装 Containerd 和 crictl，
+需要容器可访问 Alpine 软件源，以及本机 CRM 可访问三仓库的认证与下载端点。
+
+```bash
+MIRROR_URL=http://host.docker.internal:8888 bash tests/e2e-containerd-mirror.sh
+```
+
+脚本先验证坏 mirror 和黑洞出口代理使拉取失败，再用全新运行时和内容存储，
+通过 `crictl pull` 拉取 Docker Hub、GHCR、GCR 并检查镜像摘要。
+可用 `ALPINE_IMAGE`、`HUB_IMAGE`、`GHCR_IMAGE`、`GCR_IMAGE` 覆写测试镜像。
+结束后只清理本次容器和网络，保留日志；不修改宿主 Docker 或 Containerd 配置。
+认证失败、标签不存在和上游限流会保留为真实失败，不能用客户端直连回退判断修复成功。

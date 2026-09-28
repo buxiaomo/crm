@@ -786,7 +786,7 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 .muted{color:#666;font-size:13px}
 </style></head><body>
 <h1>Container Registry Mirrors</h1>
-<p class="muted">Docker Hub 公开镜像加速器：服务端完成认证和镜像层下载，无磁盘缓存。</p>
+<p class="muted">公开镜像加速器：Docker Hub 与 Containerd 白名单内多仓库拉取，服务端完成认证和下载，无磁盘缓存。</p>
 
 <h2>代理允许的仓库</h2>
 <ul>`)
@@ -833,6 +833,19 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 [host."https://mirrors.xiaomo.site"]
   capabilities = ["pull", "resolve"]</pre>
 <p>将域名替换为自己信任的 CRM 入口；resolve 允许其解析 tag 对应的 digest。加速器失败时会回退 Docker Hub；如需禁止直连回退，将 server 也改为 https://mirrors.xiaomo.site。</p>
+<p>GHCR 与 GCR 可共用相同的 CRM 入口，分别创建以下文件：</p>
+<p><code>/etc/containerd/certs.d/ghcr.io/hosts.toml</code>：</p>
+<pre>server = "https://ghcr.io"
+
+[host."https://mirrors.xiaomo.site"]
+  capabilities = ["pull", "resolve"]</pre>
+<p><code>/etc/containerd/certs.d/gcr.io/hosts.toml</code>：</p>
+<pre>server = "https://gcr.io"
+
+[host."https://mirrors.xiaomo.site"]
+  capabilities = ["pull", "resolve"]</pre>
+<p>Containerd 自动通过 ns 参数选择原仓库；CRM 只允许白名单内仓库的 HTTPS 默认/443 端口。无 ns 时仍使用 Docker Hub。仅支持公开镜像，不转发客户端登录凭证。</p>
+<p>GHCR 下载域名 pkg-containers.githubusercontent.com 已内置。其他仓库的认证/CDN 域名需要在 allowed_hosts 中按实际情况放行；请使用精确域名或带边界的正则。</p>
 <p>修改 config.toml 后重启并通过 CRI 验证；仅修改 hosts.toml 无需重启：</p>
 <pre>sudo systemctl restart containerd
 sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
@@ -866,7 +879,7 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
           endpoint = [ "https://mirrors.xiaomo.site" ]
 </pre>
 <p>旧式 CRI 配置已弃用，不与非空 config_path 混用；新部署使用 hosts.toml。修改后重启并使用上面的 crictl 命令验证。</p>
-<p>以上配置仅加速 Docker Hub 公开镜像，不适用于 gcr.io 等其他仓库。</p>
+<p>以上配置支持 Docker Hub、GHCR 和 GCR 的公开镜像；标签必须存在且允许匿名拉取，上游权限、限流和网络错误仍会导致失败。</p>
 
 <h2>可选：前向代理</h2>
 <p>客户端应连接本服务的 HTTP 代理端口（默认 8888）。请将下例中的 proxy.example.com 替换为代理服务器地址。</p>
@@ -879,7 +892,7 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
   }
 }</pre>
 <p>Containerd：在 containerd 服务的 systemd 配置中设置 HTTP_PROXY 和 HTTPS_PROXY，然后重启服务。</p>
-<p>上述代理模式用于兼容其他仓库；其 allowed_hosts 白名单不扩展 Docker Hub 加速器的支持范围。</p>
+<p>allowed_hosts 同时用于前向代理与非 Hub mirror 的仓库、认证和下载主机；Docker Hub mirror 保持固定的认证和 CDN 范围。</p>
 
 <footer>
 若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。<br>
