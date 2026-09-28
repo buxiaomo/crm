@@ -10,6 +10,7 @@
 - 配置文件仅对服务账号可读（建议 0600）；修改账号后重启。示例只使用占位密码，不设置 admin/admin 默认凭据。
 - `ProxyHandler.ServeHTTP` 在并发限流和路由之前认证，保护 mirror、普通代理及 CONNECT。仅普通 origin-form 的 GET /、GET /healthz、GET /metrics 精确豁免；HEAD/POST、编码变体、其他路径及 absolute-form/CONNECT 不豁免。
 - 首页展示使用说明及默认仓库和配置 allowed_hosts 的实际白名单（去重、HTML 转义），不展示账号密码。metrics/healthz 公开聚合统计与健康状态（含请求量、流量、错误、连接和运行时间），用户已知悉此信息可见性；仍保留并发及请求限制。
+- 服务端本地账号配置属于部署运维说明，仅保留在 README；首页提供客户端接入说明。README 和首页的 Containerd 认证示例均并入各自 Containerd 章节，不设独立认证章节。
 - 除上述公开读接口，普通服务请求用 Authorization，失败返回 401 和 `WWW-Authenticate: Basic realm="CRM", charset="UTF-8"`；absolute-form 代理及 CONNECT 用 Proxy-Authorization，失败返回 407 和同格式 Proxy-Authenticate。缺少、重复、畸形、错误凭据均拒绝，不访问上游。
 - 正常 401/407 认证挑战不计入服务故障错误率，避免健康检查误报。
 - 使用 Go 标准库 BasicAuth 解析和 SHA-256 定长摘要的 constant-time 比较。无账号数据库、会话、JWT、token 缓存和新依赖。

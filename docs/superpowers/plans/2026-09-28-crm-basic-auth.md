@@ -97,3 +97,16 @@
 自查：仅恢复展示行为，不加开关、双版本首页、新依赖或权限逻辑；使用标准库 HTML 转义。保留用户未提交的 config.yaml。
 
 验证记录：基线 `go test ./...` 通过（3.413s）；恢复展示测试先因列表缺失失败，随后 `go test -run TestAuthPublicEndpoints -count=1 .` 通过（0.663s，含直接渲染及本地 HTTP E2E）。全量 `go test -race -count=1 ./...`、`go vet ./...` 和 `git diff --check` 通过。独立只读审查通过，确认 auth.go 与路由未改；用户 config.yaml 内容哈希保持不变。本地提交，不推送。
+
+## 任务 5：首页与 README 说明归位
+
+用户明确要求：服务端本地账号配置只在 README 说明，首页不展示；Containerd 客户端认证并入各自现有 Containerd 章节。
+
+- [x] 从 main.go 首页移除本地账号部署说明，保留实际仓库白名单；Containerd 请求头示例移入 Containerd 章节，Docker 兼容性提示移入 Docker 章节。
+- [x] README 保留可选服务端认证配置，明确其部署用途；对应客户端说明归入各运行时章节，同步设计文档。
+- [x] 运行现有全量 Go 测试（含本地 HTTP/TLS E2E），检查页面和文档的章节归属；两项只读审查分别检查文档与页面/认证边界。
+- [x] 核对 config.yaml 内容哈希未变；提交上述改动和中文文档，不推送。
+
+过度设计自查：只移动、精简说明文字，不调整认证逻辑、模板结构或依赖，也不为文案位置新增固定文本测试。复用现有首页、白名单和认证 E2E 回归。
+
+验证记录：基线 `go test ./...` 通过（3.318s）；改后 `go test -count=1 ./...` 通过（3.456s，含本地 HTTP/TLS E2E）。章节归属检查、`gofmt -l main.go` 和 `git diff --check` 通过；两项独立只读审查均无阻塞问题。认证实现、路由及测试未改动，config.yaml 内容哈希未变且不纳入提交。

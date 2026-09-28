@@ -7,9 +7,9 @@
 - k8s.io / registry.k8s.io
 - docker.elastic.co / ghcr.io
 
-## CRM 本地账号认证
+## CRM 本地账号认证（可选）
 
-在服务端配置文件加入以下内容，替换为自己的强密码后重启 CRM：
+此项为服务端部署运维配置。需要限制 CRM 使用者时，在服务端配置文件加入以下内容，替换为自己的强密码后重启 CRM：
 
 ```yaml
 auth:
@@ -37,24 +37,6 @@ curl --user admin \
 CRM 校验后删除这组凭据；上游 token、Registry 和 CDN 不会收到本地账号密码。
 CRM 仍然只匿名拉取公开镜像，本地认证不会授予上游私有镜像访问权限。
 
-Containerd 在各仓库的 `hosts.toml` 中，为 **CRM host** 增加专属请求头：
-
-```toml
-server = "https://ghcr.io"
-
-[host."https://mirrors.xiaomo.site"]
-  capabilities = ["pull", "resolve"]
-  [host."https://mirrors.xiaomo.site".header]
-    Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"
-```
-
-将占位符替换为 `用户名:密码` 的 Base64（单行、无尾随换行）；其他仓库只需调整
-`server` 和对应目录。不要给上游 host 或全局请求配置这组凭据。
-若要禁止上游直连回退，`server` 也改成 CRM 地址。
-参见 [Containerd header 配置](https://github.com/containerd/containerd/blob/main/docs/hosts.md#header-fields)。
-Docker Engine 的 `registry-mirrors` 能否携带 URL 凭据不能由 curl 成功推断；
-上面的匿名 Docker 示例不适用于需要 Basic 认证的服务，需单独验证运行时支持。
-
 兼容的 HTTP/CONNECT 前向代理使用 **Proxy-Authorization** 认证，缺少或错误时返回
 `407 + Proxy-Authenticate`。例如本机代理可用：
 
@@ -66,11 +48,14 @@ CRM 会移除代理凭据，保留请求原本面向上游的 `Authorization`；
 CONNECT 隧道，不要求在隧道内部重复发送 CRM 凭据。
 
 Basic 和 Base64 不提供加密。对外通过 HTTPS 使用；CRM 裸 HTTP 监听仅用于本机或可信内网。
-配置文件和包含 Basic 头的 `hosts.toml` 应限制为服务账号可读（例如 `chmod 600`），
+配置文件应限制为服务账号可读（例如 `chmod 600`），
 不要把真实密码写进 Git 或分享含密码的 URL。已有 Nginx/Caddy 配置默认透传认证头，
 无需在前端再次配置另一套密码。
 
 ## Docker 镜像加速器（推荐）
+
+本节示例适用于匿名访问。CRM 启用 Basic 认证时，需单独验证 Docker Engine 的认证支持；
+`registry-mirrors` 能否携带 URL 凭据不能由 curl 成功推断。
 
 将以下配置合并到客户端的 `/etc/docker/daemon.json`：
 
@@ -157,6 +142,19 @@ server = "https://gcr.io"
 [host."https://mirrors.xiaomo.site"]
   capabilities = ["pull", "resolve"]
 ```
+
+如果 CRM 要求账号认证，在上述各仓库的 `hosts.toml` 中，为 **CRM host** 添加以下请求头。
+Containerd 不会从 host URL 中读取用户名和密码，不要使用 `https://用户名:密码@镜像站`：
+
+```toml
+[host."https://mirrors.xiaomo.site".header]
+  Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"
+```
+
+对不带换行的 `用户名:密码` 做 Base64 编码，将单行结果填入占位符。
+不要给上游 host 或全局请求配置这组凭据；CRM 校验后不会将其转发到上游。
+Base64 不是加密，必须使用 HTTPS，并限制 `hosts.toml` 为服务账号可读（例如 `chmod 600`）。
+参见 [Containerd header 配置](https://github.com/containerd/containerd/blob/main/docs/hosts.md#header-fields)。
 
 Containerd 自动附加 `?ns=ghcr.io` 或 `?ns=gcr.io`，CRM 在白名单内选择上游；
 无 `ns` 时仍使用 Docker Hub。仓库地址仅支持 HTTPS 默认端口或 443。

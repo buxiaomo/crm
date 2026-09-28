@@ -806,18 +806,6 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 <h1>Container Registry Mirrors</h1>
 <p class="muted">公开镜像加速器：Docker Hub 与 Containerd 白名单内多仓库拉取，服务端完成认证和下载，无磁盘缓存。</p>
 
-<h2>CRM 本地账号认证（可选）</h2>
-<pre>auth:
-  users:
-    admin: "REPLACE_WITH_A_STRONG_PASSWORD"</pre>
-<p>配置 auth.users 并重启后，mirror 要求 Basic 认证，失败返回 401；HTTP/CONNECT 前向代理使用 Proxy-Authorization，失败返回 407。仅普通 GET /、GET /healthz 和 GET /metrics 允许匿名访问；首页展示实际仓库白名单，监控接口公开聚合统计和健康状态。省略 auth 保持匿名访问。</p>
-<pre>curl --user admin 'https://mirrors.xiaomo.site/v2/buxiaomo/kubeasy/manifests/v1.34.12?ns=ghcr.io'</pre>
-<p>curl 会提示输入密码。支持 URL 凭据的客户端也可用 https://用户名:密码@mirrors.xiaomo.site/v2/...，但不要分享或保存含密码的 URL。CRM 校验后丢弃本地凭据，上游继续匿名拉取。</p>
-<p>Containerd 为 CRM host 单独配置请求头：</p>
-<pre>[host."https://mirrors.xiaomo.site".header]
-  Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
-<p>Base64 不是加密；对外必须使用 HTTPS，并限制密码配置文件读取权限。启用认证后，以下匿名 Docker 示例不能直接套用，需另外验证客户端认证支持。</p>
-
 <h2>代理允许的仓库</h2>
 <ul>`)
 	shown := make(map[string]struct{})
@@ -836,6 +824,7 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 	fmt.Fprint(w, `</ul>
 
 <h2>Docker 镜像加速</h2>
+<p>以下示例适用于匿名访问；CRM 启用 Basic 认证时，需另外验证 Docker Engine 的认证支持，不能由 curl 成功推断。</p>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
 <pre>{
   "registry-mirrors": ["https://mirrors.xiaomo.site"]
@@ -873,6 +862,10 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 
 [host."https://mirrors.xiaomo.site"]
   capabilities = ["pull", "resolve"]</pre>
+<p>如果 CRM 要求账号认证，在上述各仓库的 hosts.toml 中为 CRM host 添加以下请求头；Containerd 不会从 host URL 中读取用户名和密码：</p>
+<pre>[host."https://mirrors.xiaomo.site".header]
+  Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
+<p>对不带换行的“用户名:密码”做 Base64 编码，将单行结果填入占位符。仅为 CRM host 配置此请求头，CRM 校验后不会将其转发到上游。Base64 不是加密，必须使用 HTTPS，并限制 hosts.toml 为服务账号可读。</p>
 <p>Containerd 自动通过 ns 参数选择原仓库；CRM 只允许白名单内仓库的 HTTPS 默认/443 端口。无 ns 时仍使用 Docker Hub。仅支持公开镜像，不转发客户端登录凭证。</p>
 <p>GHCR 下载域名 pkg-containers.githubusercontent.com 已内置。其他仓库的认证/CDN 域名需要在 allowed_hosts 中按实际情况放行；请使用精确域名或带边界的正则。</p>
 <p>修改 config.toml 后重启并通过 CRI 验证；仅修改 hosts.toml 无需重启：</p>
@@ -913,6 +906,7 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
 <h2>可选：前向代理</h2>
 <p>客户端应连接本服务的 HTTP 代理端口（默认 8888）。请将下例中的 proxy.example.com 替换为代理服务器地址。</p>
 <pre>curl -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/</pre>
+<p>如需代理认证，curl 命令增加 <code>--proxy-user 用户名</code> 并按提示输入密码；凭据仅用于 CRM 认证。</p>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
 <pre>{
   "proxies": {
