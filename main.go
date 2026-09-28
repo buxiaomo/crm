@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"flag"
@@ -27,8 +28,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"encoding/json"
 
 	yaml "gopkg.in/yaml.v3"
 )
@@ -81,6 +80,8 @@ func sanitizeUserAgent(ua string) string {
 var defaultAllowedHosts = []string{
 	"docker.io",
 	"registry-1.docker.io",
+	"auth.docker.io",
+	"production.cloudfront.docker.com",
 	"gcr.io",
 	"k8s.io",
 	"registry.k8s.io",
@@ -124,11 +125,12 @@ func (c *Config) Validate() error {
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			return fmt.Errorf("socket directory does not exist: %s", dir)
 		}
-		// 如果 socket 文件已存在，尝试删除它
-		if _, err := os.Stat(c.SocketPath); err == nil {
-			if err := os.Remove(c.SocketPath); err != nil {
-				return fmt.Errorf("failed to remove existing socket file: %v", err)
+		if info, err := os.Lstat(c.SocketPath); err == nil {
+			if info.Mode()&os.ModeSocket == 0 {
+				return fmt.Errorf("socket path is not a socket: %s", c.SocketPath)
 			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("check socket path: %w", err)
 		}
 	}
 
@@ -176,29 +178,6 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// ErrorResponse represents a structured error response
-type ErrorResponse struct {
-	Error   string `json:"error"`
-	Code    int    `json:"code"`
-	Message string `json:"message"`
-}
-
-// sendErrorResponse sends a structured error response
-func sendErrorResponse(w http.ResponseWriter, statusCode int, message string) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-
-	response := ErrorResponse{
-		Error:   http.StatusText(statusCode),
-		Code:    statusCode,
-		Message: message,
-	}
-
-	// 简单的JSON编码，避免引入额外依赖
-	fmt.Fprintf(w, `{"error":"%s","code":%d,"message":"%s"}`,
-		response.Error, response.Code, response.Message)
-}
-
 // MITMConfig 控制中间人模式的配置
 type MITMConfig struct {
 	Enabled    bool   `yaml:"enabled" json:"enabled"`           // 是否启用 MITM 模式
@@ -230,24 +209,7 @@ func loadConfigAuto() (*Config, error) {
 	if path == "" {
 		return nil, fmt.Errorf("no config file found; expected one of: %v", candidates)
 	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg Config
-	switch {
-	case strings.HasSuffix(path, ".yaml"), strings.HasSuffix(path, ".yml"):
-		if err := yaml.Unmarshal(b, &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse YAML %s: %w", path, err)
-		}
-	case strings.HasSuffix(path, ".json"):
-		if err := json.Unmarshal(b, &cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse JSON %s: %w", path, err)
-		}
-	default:
-		return nil, fmt.Errorf("unsupported config file extension: %s", path)
-	}
-	return &cfg, nil
+	return loadConfigFrom(path)
 }
 
 // loadConfigFrom loads configuration from a specific file path.
@@ -306,8 +268,8 @@ func buildAllowedPatterns(cfg *Config) []*regexp.Regexp {
 			if s == "" {
 				continue
 			}
-			// detect regex metacharacters
-			if strings.ContainsAny(s, ".[+*?^$(){}|\\]") {
+			// A dot alone is part of a literal hostname, not a regex marker.
+			if strings.ContainsAny(s, "[+*?^$(){}|\\]") {
 				// treat as user-supplied regex; make it case-insensitive
 				s = "(?i)" + s
 			} else {
@@ -327,8 +289,8 @@ func buildAllowedPatterns(cfg *Config) []*regexp.Regexp {
 
 func isAllowedHost(host string, patterns []*regexp.Regexp) bool {
 	// strip port if present
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		host = host[:i]
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
 	}
 	for _, re := range patterns {
 		if re.MatchString(host) {
@@ -404,7 +366,7 @@ func loadCA(certPath, keyPath string) (*CertificateAuthority, error) {
 func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificate, error) {
 	// 检查缓存
 	ca.cacheMutex.RLock()
-	if cert, ok := ca.certCache[hostname]; ok {
+	if cert, ok := ca.certCache[hostname]; ok && cert.Leaf != nil && time.Now().Add(time.Minute).Before(cert.Leaf.NotAfter) {
 		ca.cacheMutex.RUnlock()
 		return cert, nil
 	}
@@ -415,7 +377,7 @@ func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificat
 	defer ca.cacheMutex.Unlock()
 
 	// 再次检查缓存（避免并发生成）
-	if cert, ok := ca.certCache[hostname]; ok {
+	if cert, ok := ca.certCache[hostname]; ok && cert.Leaf != nil && time.Now().Add(time.Minute).Before(cert.Leaf.NotAfter) {
 		return cert, nil
 	}
 
@@ -455,6 +417,7 @@ func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificat
 	cert := &tls.Certificate{
 		Certificate: [][]byte{certDER},
 		PrivateKey:  privKey,
+		Leaf:        &template,
 	}
 
 	// 存入缓存
@@ -524,14 +487,20 @@ func nextReqID() string {
 	return fmt.Sprintf("%08x", id)
 }
 
-type writeCounter struct {
-	w http.ResponseWriter
-	n int64
+// limitedBody prevents Transport.Close from draining a rejected chunked upload.
+type limitedBody struct {
+	io.ReadCloser
+	w        http.ResponseWriter
+	exceeded atomic.Bool
 }
 
-func (wc *writeCounter) Write(p []byte) (int, error) {
-	n, err := wc.w.Write(p)
-	wc.n += int64(n)
+func (b *limitedBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	var sizeErr *http.MaxBytesError
+	if errors.As(err, &sizeErr) {
+		b.exceeded.Store(true)
+		_ = http.NewResponseController(b.w).SetReadDeadline(time.Now())
+	}
 	return n, err
 }
 
@@ -557,6 +526,11 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "请求体过大", http.StatusRequestEntityTooLarge)
 		return
 	}
+	body := &limitedBody{
+		ReadCloser: http.MaxBytesReader(w, r.Body, globalConfig.Security.MaxRequestSize),
+		w:          w,
+	}
+	r.Body = body
 
 	// 设置请求超时
 	ctx, cancel := context.WithTimeout(r.Context(), globalConfig.Security.RequestTimeout)
@@ -631,7 +605,7 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create outbound request
-	outReq := r.Clone(context.Background())
+	outReq := r.Clone(r.Context())
 	// Remove proxy headers that should not be forwarded
 	outReq.RequestURI = ""
 	outReq.Host = r.URL.Host
@@ -683,7 +657,14 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := p.transport.RoundTrip(outReq)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("upstream error: %v", err), http.StatusBadGateway)
+		status := proxyErrorStatus(err)
+		if body.exceeded.Load() {
+			status = http.StatusRequestEntityTooLarge
+		}
+		if status == http.StatusRequestEntityTooLarge {
+			w.Header().Set("Connection", "close")
+		}
+		http.Error(w, fmt.Sprintf("upstream error: %v", err), status)
 		return
 	}
 	defer resp.Body.Close()
@@ -697,13 +678,13 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	// Stream body without buffering (no caching)
-	wc := &writeCounter{w: w}
-	if _, err := io.Copy(wc, resp.Body); err != nil {
+	n, err := io.Copy(w, resp.Body)
+	if err != nil {
 		// client disconnected or write error; log and ignore
 		log.Printf("stream error: %v", err)
 	}
 	// 统计传输字节数
-	atomic.AddInt64(&metrics.TotalBytes, wc.n)
+	atomic.AddInt64(&metrics.TotalBytes, n)
 
 	dur := time.Since(start)
 	if p.level >= LevelDebug {
@@ -720,10 +701,18 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if cl == "" {
 			cl = "unknown"
 		}
-		log.Printf("[req %s] HTTP done status=%d bytes_sent=%d content-length=%s duration=%s", reqID, resp.StatusCode, wc.n, cl, dur)
+		log.Printf("[req %s] HTTP done status=%d bytes_sent=%d content-length=%s duration=%s", reqID, resp.StatusCode, n, cl, dur)
 	} else {
 		log.Printf("%s %s -> %d in %s", r.Method, r.URL.String(), resp.StatusCode, dur)
 	}
+}
+
+func proxyErrorStatus(err error) int {
+	var sizeErr *http.MaxBytesError
+	if errors.As(err, &sizeErr) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadGateway
 }
 
 // serveMetrics serves basic metrics in plain text format
@@ -811,48 +800,55 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 	}
 	fmt.Fprint(w, `</ul>
 
-<h2>使用方式（加速器风格）</h2>
-<p>将本服务作为镜像加速器或代理：</p>
-<ul>
-  <li><b>Docker 守护进程（仅 docker.io/registry-1.docker.io）：</b>
-    在 <code>/etc/docker/daemon.json</code> 设置：
-    <pre>{
-  "registry-mirrors": ["https://mirrors.xiaomo.site"]
+<h2>使用方式（前向代理）</h2>
+<p>客户端应连接本服务的 HTTP 代理端口（默认 8888）。请将下例中的 proxy.example.com 替换为代理服务器地址。</p>
+<pre>curl -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/</pre>
+<p>Docker Engine 的 /etc/docker/daemon.json：</p>
+<pre>{
+  "proxies": {
+    "http-proxy": "http://proxy.example.com:8888",
+    "https-proxy": "http://proxy.example.com:8888"
+  }
 }</pre>
-  </li>
-
-  <li><b>Containerd：</b>
-    在 <code>/etc/containerd/config.toml</code> 设置：
-    <pre>[plugins]
-  [plugins."io.containerd.grpc.v1.cri"]
-    [plugins."io.containerd.grpc.v1.cri".registry]
-      [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."gcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.elastic.co"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."ghcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."k8s.gcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."mcr.microsoft.com"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."nvcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."quay.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]</pre>
-  </li>
-</ul>
+<p>Containerd：在 containerd 服务的 systemd 配置中设置 HTTP_PROXY 和 HTTPS_PROXY，然后重启服务。</p>
+<p>本服务不提供 Registry mirror API，不能配置为 registry-mirrors 或 containerd registry endpoint。仓库认证及下载重定向域名也需要在白名单中。</p>
 
 <footer>
 若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。<br>
 项目地址：<a href="https://github.com/buxiaomo/crm.git" target="_blank">https://github.com/buxiaomo/crm.git</a>
 </footer>
 </body></html>`)
+}
+
+// bufferedConn preserves bytes read ahead while parsing CONNECT.
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) {
+	return c.reader.Read(b)
+}
+
+func connectClient(w http.ResponseWriter, r *http.Request) (net.Conn, error) {
+	conn, rw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return nil, err
+	}
+	// Replace inherited HTTP deadlines with the CONNECT request deadline.
+	deadline, _ := r.Context().Deadline()
+	if err = conn.SetDeadline(deadline); err == nil {
+		_, err = rw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+	}
+	if err == nil {
+		err = rw.Flush()
+	}
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return &bufferedConn{Conn: conn, reader: rw.Reader}, nil
 }
 
 func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, reqID string, clientAddr string, start time.Time) {
@@ -873,7 +869,7 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, req
 	}
 
 	// 标准 CONNECT 处理（透明隧道）
-	upstream, err := net.DialTimeout("tcp", host, 10*time.Second)
+	upstream, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(r.Context(), "tcp", host)
 	if err != nil {
 		errMsg := fmt.Sprintf("dial upstream failed: %v", err)
 		http.Error(w, errMsg, http.StatusBadGateway)
@@ -881,33 +877,15 @@ func (p *ProxyHandler) handleConnect(w http.ResponseWriter, r *http.Request, req
 		return
 	}
 	defer upstream.Close() // 确保连接关闭
+	stop := context.AfterFunc(r.Context(), func() { upstream.Close() })
+	defer stop()
 
-	// Hijack client connection
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		log.Printf("[req %s] 不支持连接劫持", reqID)
-		return
-	}
-
-	clientConn, clientBuf, err := hj.Hijack()
+	clientConn, err := connectClient(w, r)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
-		log.Printf("[req %s] 连接劫持失败: %v", reqID, err)
+		log.Printf("[req %s] 建立隧道失败: %v", reqID, err)
 		return
 	}
-	defer clientConn.Close() // 确保连接关闭
-
-	// Send 200 Connection Established
-	if _, err := clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		log.Printf("[req %s] 发送连接建立响应失败: %v", reqID, err)
-		return
-	}
-
-	if err := clientBuf.Flush(); err != nil {
-		log.Printf("[req %s] 刷新缓冲区失败: %v", reqID, err)
-		return
-	}
+	defer clientConn.Close()
 
 	// Bidirectional copy with byte counting
 	up2cl, cl2up := tunnelCopy(clientConn, upstream)
@@ -937,32 +915,12 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	// Hijack client connection
-	hj, ok := w.(http.Hijacker)
-	if !ok {
-		log.Printf("[req %s] 不支持连接劫持", reqID)
-		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-
-	clientConn, clientBuf, err := hj.Hijack()
+	clientConn, err := connectClient(w, r)
 	if err != nil {
-		log.Printf("[req %s] 连接劫持失败: %v", reqID, err)
-		http.Error(w, fmt.Sprintf("hijack failed: %v", err), http.StatusInternalServerError)
+		log.Printf("[req %s] 建立隧道失败: %v", reqID, err)
 		return
 	}
-	defer clientConn.Close() // 确保连接关闭
-
-	// Send 200 Connection Established
-	if _, err := clientBuf.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
-		log.Printf("[req %s] 发送连接建立响应失败: %v", reqID, err)
-		return
-	}
-
-	if err := clientBuf.Flush(); err != nil {
-		log.Printf("[req %s] 刷新缓冲区失败: %v", reqID, err)
-		return
-	}
+	defer clientConn.Close()
 
 	// 创建 TLS 配置
 	tlsConfig := &tls.Config{
@@ -971,7 +929,7 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 
 	// 将连接升级为 TLS
 	tlsConn := tls.Server(clientConn, tlsConfig)
-	if err := tlsConn.Handshake(); err != nil {
+	if err := tlsConn.HandshakeContext(r.Context()); err != nil {
 		log.Printf("[req %s] TLS 握手失败: %v", reqID, err)
 		tlsConn.Close()
 		return
@@ -983,11 +941,6 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 
 	// 处理来自客户端的 HTTP 请求
 	for {
-		// 设置读取超时
-		if err := tlsConn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
-			break
-		}
-
 		// 读取请求
 		req, err := http.ReadRequest(connReader)
 		if err != nil {
@@ -998,9 +951,13 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 		}
 
 		// 修改请求以发送到上游
+		req = req.WithContext(r.Context())
 		req.URL.Scheme = "https"
 		req.URL.Host = host
+		req.Host = host
 		req.RequestURI = ""
+		// The tunnel owns this body; Transport must not drain it after a size error.
+		req.Body = http.MaxBytesReader(nil, io.NopCloser(req.Body), globalConfig.Security.MaxRequestSize)
 
 		// 记录请求信息
 		if p.level >= LevelInfo {
@@ -1025,14 +982,19 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 		}
 
 		// 发送请求到上游
-		resp, err := p.transport.RoundTrip(req)
+		var resp *http.Response
+		if req.ContentLength > globalConfig.Security.MaxRequestSize {
+			err = &http.MaxBytesError{Limit: globalConfig.Security.MaxRequestSize}
+		} else {
+			resp, err = p.transport.RoundTrip(req)
+		}
 		if err != nil {
 			log.Printf("[req %s] MITM 上游请求失败: %v", reqID, err)
 
 			// 向客户端返回错误
 			errResp := &http.Response{
-				StatusCode: http.StatusBadGateway,
-				Status:     "502 Bad Gateway",
+				StatusCode: proxyErrorStatus(err),
+				Close:      true,
 				Proto:      "HTTP/1.1",
 				ProtoMajor: 1,
 				ProtoMinor: 1,
@@ -1063,8 +1025,11 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 		}
 
 		// 将响应写回客户端
-		resp.Header.Set("Connection", "keep-alive") // 保持连接
-		if err := resp.Write(connWriter); err != nil {
+		// ponytail: close after uploads; track writer completion if upload keep-alive is needed.
+		resp.Close = resp.Close || req.Close || req.ContentLength != 0 || len(req.TransferEncoding) > 0
+		err = resp.Write(connWriter)
+		resp.Body.Close()
+		if err != nil {
 			log.Printf("[req %s] 写入响应失败: %v", reqID, err)
 			break
 		}
@@ -1073,11 +1038,8 @@ func (p *ProxyHandler) handleMITMConnect(w http.ResponseWriter, r *http.Request,
 			break
 		}
 
-		// 关闭响应体
-		resp.Body.Close()
-
 		// 检查是否需要关闭连接
-		if resp.Header.Get("Connection") == "close" {
+		if resp.Close {
 			break
 		}
 	}
@@ -1123,6 +1085,31 @@ func tunnelCopy(client net.Conn, upstream net.Conn) (upstreamToClient int64, cli
 	_ = upstream.Close()
 	<-done
 	return n1, n2
+}
+
+// listenUnix only removes a stale socket whose listener is no longer running.
+func listenUnix(path string) (net.Listener, error) {
+	info, err := os.Lstat(path)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if err == nil {
+		if info.Mode()&os.ModeSocket == 0 {
+			return nil, fmt.Errorf("socket path is not a socket: %s", path)
+		}
+		conn, err := net.DialTimeout("unix", path, time.Second)
+		if err == nil {
+			conn.Close()
+			return nil, fmt.Errorf("socket is already in use: %s", path)
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			return nil, fmt.Errorf("check existing socket: %w", err)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	}
+	return net.Listen("unix", path)
 }
 
 func main() {
@@ -1195,25 +1182,21 @@ func main() {
 	// 创建代理处理器和服务器
 	handler := newProxyHandler(allowed, display, insecure, level, cfg)
 	srv := &http.Server{
-		Addr:           listenAddr,
-		Handler:        logMiddleware(level, handler),
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
-		IdleTimeout:    120 * time.Second,
-		MaxHeaderBytes: int(globalConfig.Security.MaxHeaderSize),
+		Addr:              listenAddr,
+		Handler:           logMiddleware(level, handler),
+		ReadHeaderTimeout: 30 * time.Second,
+		ReadTimeout:       cfg.Security.RequestTimeout,
+		WriteTimeout:      cfg.Security.RequestTimeout,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    int(globalConfig.Security.MaxHeaderSize),
 	}
 
 	// 设置优雅关闭
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// 启动服务器的 WaitGroup
-	var wg sync.WaitGroup
-
 	// 在单独的 goroutine 中启动 TCP 服务器
-	wg.Add(1)
 	go func() {
-		defer wg.Done()
 		// 启动 TCP 服务器
 		log.Printf("Container Registry Mirrors 正在监听 TCP %s", listenAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1225,18 +1208,17 @@ func main() {
 	var socketSrv *http.Server
 	if cfg.SocketPath != "" {
 		socketSrv = &http.Server{
-			Handler:        logMiddleware(level, handler),
-			ReadTimeout:    30 * time.Second,
-			WriteTimeout:   30 * time.Second,
-			IdleTimeout:    120 * time.Second,
-			MaxHeaderBytes: int(globalConfig.Security.MaxHeaderSize),
+			Handler:           logMiddleware(level, handler),
+			ReadHeaderTimeout: 30 * time.Second,
+			ReadTimeout:       cfg.Security.RequestTimeout,
+			WriteTimeout:      cfg.Security.RequestTimeout,
+			IdleTimeout:       120 * time.Second,
+			MaxHeaderBytes:    int(globalConfig.Security.MaxHeaderSize),
 		}
 
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
 			// 创建 Unix socket 监听器
-			listener, err := net.Listen("unix", cfg.SocketPath)
+			listener, err := listenUnix(cfg.SocketPath)
 			if err != nil {
 				log.Fatalf("无法创建 Unix socket 监听器: %v", err)
 			}
@@ -1272,12 +1254,6 @@ func main() {
 		if err := socketSrv.Shutdown(shutdownCtx); err != nil {
 			log.Printf("Unix socket 服务器关闭出错: %v", err)
 		}
-		// 清理 socket 文件
-		if cfg.SocketPath != "" {
-			if err := os.Remove(cfg.SocketPath); err != nil {
-				log.Printf("警告: 无法删除 socket 文件: %v", err)
-			}
-		}
 	}
 
 	log.Println("服务器已安全关闭")
@@ -1288,6 +1264,10 @@ type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
 	written    bool
+}
+
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
 }
 
 func (rw *responseWriter) WriteHeader(code int) {

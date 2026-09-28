@@ -1,3 +1,4 @@
+# 首页、健康检查和指标入口；容器客户端使用 CRM 的 HTTP 代理端口 8888。
 mirrors.xiaomo.site {
     log
     encode gzip
