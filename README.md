@@ -19,9 +19,10 @@ auth:
 ```
 
 省略 `auth`（或设为 `null`）时保持匿名兼容；配置了 `auth` 却没有有效账号时拒绝启动。
-启用后，mirror、首页、`/healthz`、`/metrics` 均需要认证；未携带或错误凭据返回
+启用后，mirror 需要认证；未携带或错误凭据返回
 `401`，并带 CRM 自己的 Basic 认证挑战。每个请求重新校验，不创建登录会话。
-监控和健康检查也需要携带账号密码。
+仅普通 `GET /`、`GET /healthz` 和 `GET /metrics` 允许匿名访问；其他方法、路径和前向代理请求仍要求认证。
+首页不展示实际仓库白名单或账号配置；监控接口会公开请求量、流量、错误率、连接数和运行时间等聚合信息。
 
 支持这种 URL 形式：`https://用户名:密码@mirrors.xiaomo.site/v2/...`，
 前提是客户端支持 URL userinfo，并将其转换为 `Authorization: Basic ...`。
@@ -234,7 +235,7 @@ go build -o crm
 推荐使用 YAML：复制示例 `config.yaml` 并根据需要修改。程序会优先读取当前目录的 `config.yaml` / `config.yml`，其次读取 `config.json`；也可通过命令行 `-config` 指定路径。若未找到配置文件，程序会直接退出并提示错误。
 
 配置项说明：
-- `auth.users`: 可选的 CRM 本地账号密码映射；配置后全部入口要求认证，详见上文。
+- `auth.users`: 可选的 CRM 本地账号密码映射；配置后镜像拉取和代理要求认证，首页与监控的普通 GET 请求公开，详见上文。
 - `listen`: 监听地址，例如 `:8888`
 - `socket_path`: 可选 Unix socket 路径，例如 `/run/crm.sock`；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
 - `allowed_hosts`: 在默认白名单基础上追加前向代理及非 Hub mirror 的仓库、认证和下载主机，支持正则表达式（不区分大小写）；Hub mirror 保留固定认证/CDN 范围。

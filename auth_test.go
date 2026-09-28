@@ -33,7 +33,7 @@ func enableTestAuth(t *testing.T, p *ProxyHandler) {
 	if err := json.Unmarshal([]byte(`{"auth":{"users":{"crm-user":"p@ss:/?# with space","second":"another-secret"}}}`), globalConfig); err != nil {
 		t.Fatal(err)
 	}
-	configured := newProxyHandler(p.allowedPatterns, p.allowedDisplay, false, p.level, globalConfig)
+	configured := newProxyHandler(p.allowedPatterns, false, p.level, globalConfig)
 	configured.transport.CloseIdleConnections()
 	configured.transport = p.transport
 	*p = *configured
@@ -89,7 +89,7 @@ func TestAuthConfigLoading(t *testing.T) {
 				t.Fatal(err)
 			}
 			p := testProxyHandler(t)
-			p = newProxyHandler(p.allowedPatterns, nil, false, 0, cfg)
+			p = newProxyHandler(p.allowedPatterns, false, 0, cfg)
 			t.Cleanup(p.transport.CloseIdleConnections)
 			for _, credentials := range []string{"", authTestHeader("alice", "loaded-secret")} {
 				req := httptest.NewRequest(http.MethodGet, "/v2/", nil)
@@ -141,11 +141,16 @@ func TestAuthProtectsEveryEntry(t *testing.T) {
 		method, path string
 		proxy        bool
 	}{
-		{"GET", "/", false}, {"GET", "/healthz", false}, {"GET", "/metrics", false},
+		{"HEAD", "/", false}, {"POST", "/", false}, {"OPTIONS", "/", false},
+		{"HEAD", "/healthz", false}, {"POST", "/metrics", false},
+		{"GET", "/healthz/", false}, {"GET", "/metrics/other", false},
+		{"GET", "/%68ealthz", false}, {"GET", "/%6detrics", false}, {"GET", "/%2f", false},
 		{"GET", "/v2/", false}, {"HEAD", "/v2/", false},
 		{"GET", "/v2/library/nginx/manifests/latest", false},
 		{"GET", "/v2/library/nginx/blobs/test", false}, {"POST", "/v2/upload", false},
 		{"GET", "http://127.0.0.1:9/v2/", true}, {"CONNECT", "127.0.0.1:9", true},
+		{"GET", "http://127.0.0.1:9/", true},
+		{"GET", "http://127.0.0.1:9/metrics", true}, {"GET", "http://127.0.0.1:9/healthz", true},
 	} {
 		for _, credentials := range []struct {
 			name   string
@@ -334,22 +339,24 @@ func TestAuthHTTPProxyCredentials(t *testing.T) {
 	transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 3 * time.Second}
-	req, err := http.NewRequest(http.MethodGet, upstream.URL+"/v2/resource", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req.Header.Set("Authorization", "Bearer upstream-secret")
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK || string(body) != "upstream" || requests.Load() != 1 {
-		t.Errorf("authenticated proxy status=%d body=%q requests=%d", resp.StatusCode, body, requests.Load())
+	for i, path := range []string{"/v2/resource", "/", "/metrics", "/healthz"} {
+		req, err := http.NewRequest(http.MethodGet, upstream.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer upstream-secret")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK || string(body) != "upstream" || requests.Load() != int64(i+1) {
+			t.Errorf("authenticated proxy %s status=%d requests=%d; expected upstream content", path, resp.StatusCode, requests.Load())
+		}
 	}
 }
 
@@ -441,5 +448,83 @@ func TestAuthChallengePreservesHealth(t *testing.T) {
 	p.ServeHTTP(resp, req)
 	if resp.Code != http.StatusOK {
 		t.Errorf("normal auth challenge marked the service unhealthy: status=%d", resp.Code)
+	}
+}
+
+func TestAuthPublicEndpoints(t *testing.T) {
+	base := testProxyHandler(t)
+	enableTestAuth(t, base)
+	globalConfig.AllowedHosts = []string{"private-registry.internal.invalid"}
+	p := newProxyHandler(buildAllowedPatterns(globalConfig), false, 0, globalConfig)
+	t.Cleanup(p.transport.CloseIdleConnections)
+	oldMetrics := metrics
+	metrics = &Metrics{StartTime: time.Now()}
+	t.Cleanup(func() { metrics = oldMetrics })
+	p.transport.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		t.Error("public endpoint or unauthenticated mirror request reached upstream")
+		return nil, fmt.Errorf("unexpected upstream access")
+	}
+	assertNoSecrets := func(body string) {
+		t.Helper()
+		for _, secret := range []string{globalConfig.AllowedHosts[0], authTestUser, authTestPassword, "another-secret"} {
+			if strings.Contains(body, secret) {
+				t.Error("public response disclosed running configuration")
+			}
+		}
+	}
+	// Check rendering separately so a 401 cannot hide configuration disclosure.
+	page := httptest.NewRecorder()
+	p.serveIndex(page, httptest.NewRequest(http.MethodGet, "/", nil))
+	assertNoSecrets(page.Body.String())
+	server := httptest.NewServer(logMiddleware(0, p))
+	t.Cleanup(server.Close)
+	client := server.Client()
+	client.Timeout = 3 * time.Second
+	for _, endpoint := range []struct{ path, contentType, content string }{
+		{"/", "text/html", "Container Registry Mirrors"},
+		{"/healthz", "application/json", `"status": "healthy"`},
+		{"/metrics", "text/plain", "total_requests "},
+	} {
+		for _, credentials := range []string{"", "Basic invalid"} {
+			req, err := http.NewRequest(http.MethodGet, server.URL+endpoint.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if credentials != "" {
+				req.Header.Set("Authorization", credentials)
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("WWW-Authenticate") != "" {
+				t.Errorf("public GET %s status=%d challenge=%q", endpoint.path, resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
+			}
+			if !strings.HasPrefix(resp.Header.Get("Content-Type"), endpoint.contentType) || !strings.Contains(string(body), endpoint.content) {
+				t.Errorf("public GET %s did not return its expected content", endpoint.path)
+			}
+			assertNoSecrets(string(body))
+		}
+	}
+	resp, err := client.Get(server.URL + "/v2/library/nginx/manifests/latest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("public requests authorized a subsequent mirror pull: status=%d", resp.StatusCode)
+	}
+	// Public endpoints still share the existing concurrency limit.
+	concurrentReqs = make(chan struct{}, 1)
+	concurrentReqs <- struct{}{}
+	busy := httptest.NewRecorder()
+	p.ServeHTTP(busy, httptest.NewRequest(http.MethodGet, "/", nil))
+	if busy.Code != http.StatusTooManyRequests {
+		t.Errorf("public index bypassed concurrency limit: status=%d", busy.Code)
 	}
 }

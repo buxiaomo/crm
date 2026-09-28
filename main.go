@@ -433,7 +433,6 @@ func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificat
 type ProxyHandler struct {
 	auth            *AuthConfig
 	allowedPatterns []*regexp.Regexp
-	allowedDisplay  []string
 	transport       *http.Transport
 	level           LogLevel
 
@@ -443,7 +442,7 @@ type ProxyHandler struct {
 	mitmAllowed []*regexp.Regexp
 }
 
-func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS bool, level LogLevel, cfg *Config) *ProxyHandler {
+func newProxyHandler(allowed []*regexp.Regexp, insecureTLS bool, level LogLevel, cfg *Config) *ProxyHandler {
 	tr := &http.Transport{
 		Proxy:                 nil, // do not chain proxies by default
 		DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
@@ -461,7 +460,6 @@ func newProxyHandler(allowed []*regexp.Regexp, display []string, insecureTLS boo
 
 	handler := &ProxyHandler{
 		allowedPatterns: allowed,
-		allowedDisplay:  display,
 		transport:       tr,
 		level:           level,
 		mitmEnabled:     false,
@@ -558,22 +556,21 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		clientAddr = clientAddr[:i]
 	}
 
-	// Health check
-	if r.URL.Path == "/healthz" {
-		p.serveHealthCheck(w, r)
-		return
-	}
-
-	// Metrics endpoint
-	if r.URL.Path == "/metrics" {
-		p.serveMetrics(w, r)
-		return
-	}
-
-	// Index page: show supported registries and usage
-	if r.URL.Path == "/" && r.Method == http.MethodGet {
-		p.serveIndex(w, r)
-		return
+	// Local informational endpoints must not intercept forward-proxy targets.
+	if !r.URL.IsAbs() && r.URL.Host == "" {
+		switch r.URL.EscapedPath() {
+		case "/healthz":
+			p.serveHealthCheck(w, r)
+			return
+		case "/metrics":
+			p.serveMetrics(w, r)
+			return
+		case "/":
+			if r.Method == http.MethodGet {
+				p.serveIndex(w, r)
+				return
+			}
+		}
 	}
 
 	// Handle CONNECT for HTTPS tunneling
@@ -792,7 +789,7 @@ func (p *ProxyHandler) serveHealthCheck(w http.ResponseWriter, r *http.Request) 
 		activeConns, atomic.LoadInt64(&metrics.TotalRequests), errorRate)
 }
 
-// serveIndex renders a simple HTML page with allowed registries and usage.
+// serveIndex renders public usage instructions without runtime configuration.
 func (p *ProxyHandler) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, `<!DOCTYPE html><html lang="zh-CN"><head>
@@ -809,31 +806,13 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 <pre>auth:
   users:
     admin: "REPLACE_WITH_A_STRONG_PASSWORD"</pre>
-<p>配置 auth.users 并重启后，mirror、首页、healthz 和 metrics 都要求 Basic 认证，失败返回 401；HTTP/CONNECT 前向代理使用 Proxy-Authorization，失败返回 407。省略 auth 保持匿名访问。</p>
+<p>配置 auth.users 并重启后，mirror 要求 Basic 认证，失败返回 401；HTTP/CONNECT 前向代理使用 Proxy-Authorization，失败返回 407。仅普通 GET /、GET /healthz 和 GET /metrics 允许匿名访问；首页不展示实际仓库白名单，监控接口公开聚合统计和健康状态。省略 auth 保持匿名访问。</p>
 <pre>curl --user admin 'https://mirrors.xiaomo.site/v2/buxiaomo/kubeasy/manifests/v1.34.12?ns=ghcr.io'</pre>
 <p>curl 会提示输入密码。支持 URL 凭据的客户端也可用 https://用户名:密码@mirrors.xiaomo.site/v2/...，但不要分享或保存含密码的 URL。CRM 校验后丢弃本地凭据，上游继续匿名拉取。</p>
 <p>Containerd 为 CRM host 单独配置请求头：</p>
 <pre>[host."https://mirrors.xiaomo.site".header]
   Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
 <p>Base64 不是加密；对外必须使用 HTTPS，并限制密码配置文件读取权限。启用认证后，以下匿名 Docker 示例不能直接套用，需另外验证客户端认证支持。</p>
-
-<h2>代理允许的仓库</h2>
-<ul>`)
-	// list displays
-	shown := make(map[string]struct{})
-	for _, h := range p.allowedDisplay {
-		s := strings.TrimSpace(h)
-		if s == "" {
-			continue
-		}
-		key := strings.ToLower(s)
-		if _, ok := shown[key]; ok {
-			continue
-		}
-		shown[key] = struct{}{}
-		fmt.Fprintf(w, "<li>%s</li>\n", s)
-	}
-	fmt.Fprint(w, `</ul>
 
 <h2>Docker 镜像加速</h2>
 <p>Docker Engine 的 /etc/docker/daemon.json：</p>
@@ -1286,15 +1265,8 @@ func main() {
 		}
 	}
 
-	// 构建显示列表
-	display := make([]string, 0, len(defaultAllowedHosts))
-	display = append(display, defaultAllowedHosts...)
-	if cfg != nil && len(cfg.AllowedHosts) > 0 {
-		display = append(display, cfg.AllowedHosts...)
-	}
-
 	// 创建代理处理器和服务器
-	handler := newProxyHandler(allowed, display, insecure, level, cfg)
+	handler := newProxyHandler(allowed, insecure, level, cfg)
 	srv := &http.Server{
 		Addr:              listenAddr,
 		Handler:           logMiddleware(level, handler),

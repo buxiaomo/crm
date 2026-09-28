@@ -32,7 +32,7 @@ func (c *AuthConfig) Validate() error {
 }
 
 func (p *ProxyHandler) authenticate(w http.ResponseWriter, r *http.Request) bool {
-	if p.auth == nil {
+	if p.auth == nil || isPublicRequest(r) {
 		return true
 	}
 	header, challenge, status := "Authorization", "WWW-Authenticate", http.StatusUnauthorized
@@ -58,4 +58,17 @@ func (p *ProxyHandler) authenticate(w http.ResponseWriter, r *http.Request) bool
 		r.URL.User = nil
 	}
 	return true
+}
+
+// isPublicRequest limits anonymous access to local, read-only informational endpoints.
+func isPublicRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet || r.URL.IsAbs() || r.URL.Host != "" {
+		return false
+	}
+	switch r.URL.EscapedPath() {
+	case "/", "/healthz", "/metrics":
+		return true
+	default:
+		return false
+	}
 }

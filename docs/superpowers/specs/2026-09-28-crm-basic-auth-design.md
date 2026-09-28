@@ -2,14 +2,15 @@
 
 ## 目标与现状
 
-客户端可使用 `https://用户名:密码@CRM/v2/...` 或 HTTP Basic 请求头；只有配置中的用户能够使用 CRM，凭据不转发给上游。URL userinfo 由客户端转换为请求头，CRM 不解析 URL 路径中的密码。当前 main 的 mirror 已隔离客户端凭据，但全部入口均缺少访问认证。另一个未合并的 `feature/crm-auth` 使用路径密钥，不混入此次账号密码方案。
+客户端可使用 `https://用户名:密码@CRM/v2/...` 或 HTTP Basic 请求头；只有配置中的用户能够使用 CRM 的镜像拉取和代理能力，凭据不转发给上游；说明页和监控读接口允许匿名访问。URL userinfo 由客户端转换为请求头，CRM 不解析 URL 路径中的密码。当前 main 的 mirror 已隔离客户端凭据，但全部入口均缺少访问认证。另一个未合并的 `feature/crm-auth` 使用路径密钥，不混入此次账号密码方案。
 
 ## 配置与行为
 
 - 新增可选 `auth.users` 映射：用户名到密码；省略 `auth`（或 null）保持旧行为。显式 `auth: {}` 或空 users、空用户名/密码、用户名含冒号、账号密码含控制字符均拒绝启动，错误不包含凭据。
 - 配置文件仅对服务账号可读（建议 0600）；修改账号后重启。示例只使用占位密码，不设置 admin/admin 默认凭据。
-- `ProxyHandler.ServeHTTP` 在并发限流和路由之前认证，覆盖首页、healthz、metrics、mirror、普通代理及 CONNECT；无公开豁免。
-- 普通服务请求用 Authorization，失败返回 401 和 `WWW-Authenticate: Basic realm="CRM", charset="UTF-8"`；absolute-form 代理及 CONNECT 用 Proxy-Authorization，失败返回 407 和同格式 Proxy-Authenticate。缺少、重复、畸形、错误凭据均拒绝，不访问上游。
+- `ProxyHandler.ServeHTTP` 在并发限流和路由之前认证，保护 mirror、普通代理及 CONNECT。仅普通 origin-form 的 GET /、GET /healthz、GET /metrics 精确豁免；HEAD/POST、编码变体、其他路径及 absolute-form/CONNECT 不豁免。
+- 首页只返回静态说明，不展示实际 allowed_hosts 或其他运行配置。metrics/healthz 公开聚合统计与健康状态（含请求量、流量、错误、连接和运行时间），用户已知悉此信息可见性；仍保留并发及请求限制。
+- 除上述公开读接口，普通服务请求用 Authorization，失败返回 401 和 `WWW-Authenticate: Basic realm="CRM", charset="UTF-8"`；absolute-form 代理及 CONNECT 用 Proxy-Authorization，失败返回 407 和同格式 Proxy-Authenticate。缺少、重复、畸形、错误凭据均拒绝，不访问上游。
 - 正常 401/407 认证挑战不计入服务故障错误率，避免健康检查误报。
 - 使用 Go 标准库 BasicAuth 解析和 SHA-256 定长摘要的 constant-time 比较。无账号数据库、会话、JWT、token 缓存和新依赖。
 - 服务请求认证成功后移除 Authorization、Proxy-Authorization；代理请求移除 Proxy-Authorization，保留真正的上游 Authorization。CONNECT 在拨号前认证，MITM 继承隧道认证，并丢弃解密请求中的 Proxy-Authorization。
@@ -24,7 +25,7 @@
 
 ## 验证
 
-配置表测试覆盖 YAML/JSON、启用边界与无秘密错误；入口表测试覆盖 401/407、重复头和全部入口；真实本地 HTTP/TLS E2E 覆盖 URL userinfo、Hub/GHCR token/registry/CDN、HEAD/GET、摘要、成功后未认证请求仍被拒绝、前向代理与 CONNECT。日志回归确保 URL/认证头不泄漏。运行全量 Go 测试、race 与 vet；外部 Docker/CRI 拉取与线上部署分开报告。
+配置表测试覆盖 YAML/JSON、启用边界与无秘密错误；入口表测试覆盖公开路径的精确豁免及其余入口的 401/407、重复头；本地网络 E2E 验证公开接口不泄漏配置且不会授权后续拉取；真实本地 HTTP/TLS E2E 覆盖 URL userinfo、Hub/GHCR token/registry/CDN、HEAD/GET、摘要、成功后未认证请求仍被拒绝、前向代理与 CONNECT。日志回归确保 URL/认证头不泄漏。运行全量 Go 测试、race 与 vet；外部 Docker/CRI 拉取与线上部署分开报告。
 
 ## 取舍复核
 

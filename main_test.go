@@ -31,7 +31,7 @@ func testProxyHandler(t *testing.T) *ProxyHandler {
 		MaxRequestSize: 1 << 20, RequestTimeout: time.Second, MaxConcurrentReqs: 10,
 	}}
 	concurrentReqs = make(chan struct{}, 10)
-	p := newProxyHandler([]*regexp.Regexp{regexp.MustCompile(`^127\.0\.0\.1$`)}, nil, false, 0, nil)
+	p := newProxyHandler([]*regexp.Regexp{regexp.MustCompile(`^127\.0\.0\.1$`)}, false, 0, nil)
 	t.Cleanup(p.transport.CloseIdleConnections)
 	return p
 }

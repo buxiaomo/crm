@@ -2,7 +2,7 @@
 
 > 执行方式：主 agent 按 executing-plans 实施，共用工作区的测试编写、只读调研及最终审查并行分派，文件范围互不重叠。
 
-**目标：** CRM 校验本地账号密码，未认证请求不能使用任何入口，CRM 凭据不出站。
+**目标：** CRM 校验本地账号密码，未认证请求只能读取首页、健康检查和指标，不能使用镜像拉取或代理，CRM 凭据不出站。
 
 **架构：** 复用配置加载和 ProxyHandler；共用入口选择服务 Basic 或代理 Basic；mirror 保持上游匿名认证。
 
@@ -15,12 +15,12 @@
 - 分支 `feature/crm-basic-auth`；工作目录 `.worktrees/feature/crm-basic-auth`，基于 main。用户明确要求项目内 worktree，使用指定位置，保留其他工作区。
 - 中文设计和实施计划提交到分支；不推送、不合并、不部署。
 - 显式空认证配置必须拒绝；旧配置省略 auth 仍可用。
-- 服务 Basic 返回 401，代理 Basic 返回 407；所有入口无匿名豁免。
+- 服务 Basic 返回 401，代理 Basic 返回 407；仅普通 GET /、GET /healthz、GET /metrics 匿名豁免。
 - 不引入依赖，保留原上游 Authorization 的含义。
 
 ## 重点审查
 
-1. `/v2/` 探测、首页、healthz、metrics 不得绕过：入口表测试。
+1. `/v2/` 探测及非公开请求不得绕过；三个公开路径精确豁免：入口表与本地网络测试。
 2. absolute HTTP、CONNECT 与 MITM 不能绕过或泄漏代理认证：代理和隧道 E2E。
 3. 密码带冒号及 URL 特殊字符：URL userinfo 网络测试。
 4. 重复/非法认证头、未知账号、成功请求后复用连接：拒绝表与网络序列。
@@ -62,3 +62,26 @@
 - 复核发现正常 401 挑战被计入全局错误率会令 healthz 误报 503；`TestAuthChallengePreservesHealth` 已 RED（503）→GREEN（200），仅移除认证拒绝时的故障计数。
 - 最终 `go test -race -count=1 ./...`、`go vet ./...`、`go build -o /tmp/crm-basic-auth-verified .` 和 `git diff --check` 均通过；构建缓存使用上述临时路径。
 - 只验证本地网络 E2E；未执行外部 Docker/CRI 拉取，未访问线上实例、部署、合并或推送。
+
+## 任务 3：公开说明页与监控读接口（用户追加确认）
+
+**范围：** 沿用本分支和 worktree；主 agent 实现，两个子 agent 分别只读核对认证边界及页面/文档；不改用户已有的 config.yaml 本地配置。
+**文件：** auth.go、auth_test.go、main.go、main_test.go、README.md 和本设计/计划。
+**接口：** isPublicRequest(*http.Request) bool 只匹配 GET、非绝对URL、空URL.Host以及 EscapedPath 精确等于 /、/healthz、/metrics。
+
+- [x] 调整入口表，增加非 GET、绝对 URL 根路径/监控路径、编码变体、相似前缀拒绝用例；新增 TestAuthPublicEndpoints 的真实本地 HTTP E2E，验证三接口匿名可用且不展示配置，公开访问后 /v2/ 仍 401。
+- [x] 运行目标测试观察 RED；白名单哨兵直接测试 serveIndex，避免仅因认证拒绝而掩盖信息泄漏。
+- [x] 在共用认证入口精确豁免；本地页面/监控路由排除绝对URL代理请求，保留现有并发限制；删除白名单 HTML 及不再使用的 display 参数和字段。
+- [x] 更新 README/首页/中文设计，明确公开统计信息和其余认证边界。
+- [x] 目标测试、全量 race、vet、格式检查；独立只读审查后本地提交，不推送。
+
+**过度设计自查：** 只增加一个供认证使用的路径判定函数，不引入新的配置开关、路由库或两版首页。测试复用既有 httptest 与代理设施。
+
+### 本次验证记录
+
+- 基线 `go test ./...` 通过（4.024s）。
+- RED：公开接口返回 401、首页展示配置哨兵；授权代理请求上游根路径或监控路径时误返回 CRM 页面。日志分别为 `/tmp/crm-public-index-red.log` 和 `/tmp/crm-public-index-proxy-red.log`。
+- GREEN：`go test -run 'TestAuthPublicEndpoints|TestAuthProtectsEveryEntry|TestAuthHTTPProxyCredentials' -count=1 .` 通过（0.640s），含真实本地 HTTP E2E；其他镜像和 MITM 本地 TLS E2E 由全量测试回归。
+- 最终 `go test -race -count=1 ./...` 通过（5.356s）；`go vet ./...`、`go build -o /tmp/crm-public-endpoints-verified .`、`git diff --check` 通过。使用 `/tmp/crm-basic-auth-agent-gocache` 构建缓存。
+- 用户已有的 config.yaml 内容哈希与修改前一致，不纳入本次提交。
+- 两项独立只读审查均通过：认证边界及代理路由无旁路，页面、测试和文档范围一致。
