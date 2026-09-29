@@ -25,13 +25,13 @@ auth:
 首页根据实际加载的配置显示认证状态；启用时提示未授权无法使用镜像加速，关闭时说明允许匿名访问。
 首页保留默认及自定义仓库白名单，不展示账号密码或服务端账号配置；监控接口会公开请求量、流量、错误率、连接数和运行时间等聚合信息。
 
-支持这种 URL 形式：`https://用户名:密码@mirrors.xiaomo.site/v2/...`，
+支持这种 URL 形式：`https://用户名:密码@mirrors.example.com/v2/...`，
 前提是客户端支持 URL userinfo，并将其转换为 `Authorization: Basic ...`。
 特殊字符需要 URL 编码。更适合日常验证的方式是交互输入密码：
 
 ```bash
 curl --user admin \
-  'https://mirrors.xiaomo.site/v2/buxiaomo/kubeasy/manifests/v1.34.12?ns=ghcr.io'
+  'https://mirrors.example.com/v2/buxiaomo/kubeasy/manifests/v1.34.12?ns=ghcr.io'
 ```
 
 只提供用户名时，curl 会提示输入密码，详见 [curl 文档](https://curl.se/docs/manpage.html#-u)。
@@ -62,11 +62,11 @@ Basic 和 Base64 不提供加密。对外通过 HTTPS 使用；CRM 裸 HTTP 监�
 
 ```json
 {
-  "registry-mirrors": ["https://mirrors.xiaomo.site"]
+  "registry-mirrors": ["https://mirrors.example.com"]
 }
 ```
 
-`mirrors.xiaomo.site` 应指向部署了 CRM 的 HTTPS 入口，镜像名称保持不变：
+`mirrors.example.com` 应指向部署了 CRM 的 HTTPS 入口，镜像名称保持不变：
 
 ```bash
 sudo systemctl restart docker
@@ -116,13 +116,13 @@ Containerd 2.x 若仍使用配置版本 2，可沿用第一种插件路径；
 ```toml
 server = "https://registry-1.docker.io"
 
-[host."https://mirrors.xiaomo.site"]
+[host."https://mirrors.example.com"]
   capabilities = ["pull", "resolve"]
 ```
 
 这里的域名应是自己信任的 CRM 入口；`resolve` 允许其解析 tag 对应的 digest。
 上例在加速器失败时会回退 Docker Hub；如需禁止直连回退，
-将 `server` 也改为 `https://mirrors.xiaomo.site`。
+将 `server` 也改为 `https://mirrors.example.com`。
 
 GHCR 与 GCR 使用同一个 CRM 地址，分别创建以下文件：
 
@@ -131,7 +131,7 @@ GHCR 与 GCR 使用同一个 CRM 地址，分别创建以下文件：
 ```toml
 server = "https://ghcr.io"
 
-[host."https://mirrors.xiaomo.site"]
+[host."https://mirrors.example.com"]
   capabilities = ["pull", "resolve"]
 ```
 
@@ -140,15 +140,15 @@ server = "https://ghcr.io"
 ```toml
 server = "https://gcr.io"
 
-[host."https://mirrors.xiaomo.site"]
+[host."https://mirrors.example.com"]
   capabilities = ["pull", "resolve"]
 ```
 
 如果 CRM 要求账号认证，在上述各仓库的 `hosts.toml` 中，为 **CRM host** 添加以下请求头。
-Containerd 不会从 host URL 中读取用户名和密码，不要使用 `https://用户名:密码@镜像站`：
+Containerd 不会从 host URL 中读取用户名和密码，不要使用 `https://用户名:密码@mirrors.example.com`：
 
 ```toml
-[host."https://mirrors.xiaomo.site".header]
+[host."https://mirrors.example.com".header]
   Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"
 ```
 
@@ -193,7 +193,7 @@ sudo ctr images pull --hosts-dir /etc/containerd/certs.d docker.io/library/nginx
 version = 2
 
 [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-  endpoint = ["https://mirrors.xiaomo.site"]
+  endpoint = ["https://mirrors.example.com"]
 ```
 
 这套 CRI 配置已弃用，不与上面的非空 `config_path` 混用；新部署使用 `hosts.toml`。
@@ -268,12 +268,12 @@ listen: "/run/crm.sock"
 
 需要前向代理时，先将 CRM 设置为 TCP 模式（例如 `listen: ":8888"`），客户端连接代理服务器的 HTTP 端口。Docker Hub 镜像加速请优先使用上面的 `registry-mirrors` 配置。
 
-下例中的 `proxy.example.com:8888` 应替换为实际代理地址；同机运行可使用 `127.0.0.1:8888`。
+下例中的 `mirrors.example.com:8888` 应替换为实际代理地址；同机运行可使用 `127.0.0.1:8888`。
 
 ### curl
 
 ```bash
-curl -v -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/
+curl -v -x http://mirrors.example.com:8888 https://registry-1.docker.io/v2/
 ```
 
 CRM 启用本地认证时，上例需增加 `--proxy-user 用户名` 并按提示输入密码，否则会先收到 CRM 的 `407 Proxy Authentication Required`。
@@ -286,8 +286,8 @@ CRM 启用本地认证时，上例需增加 `--proxy-user 用户名` 并按提�
 ```json
 {
   "proxies": {
-    "http-proxy": "http://proxy.example.com:8888",
-    "https-proxy": "http://proxy.example.com:8888",
+    "http-proxy": "http://mirrors.example.com:8888",
+    "https-proxy": "http://mirrors.example.com:8888",
     "no-proxy": "localhost,127.0.0.1"
   }
 }
@@ -306,8 +306,8 @@ HTTPS 目标也使用 `http://` 代理地址，由 CONNECT 建立 TLS 隧道。D
 
 ```ini
 [Service]
-Environment="HTTP_PROXY=http://proxy.example.com:8888"
-Environment="HTTPS_PROXY=http://proxy.example.com:8888"
+Environment="HTTP_PROXY=http://mirrors.example.com:8888"
+Environment="HTTPS_PROXY=http://mirrors.example.com:8888"
 Environment="NO_PROXY=localhost,127.0.0.1"
 ```
 

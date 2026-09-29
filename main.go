@@ -853,14 +853,14 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 <h3>匿名访问</h3>
 <p>未开启认证时，合并到 <code>/etc/docker/daemon.json</code>：</p>
 <pre>{
-  "registry-mirrors": ["https://mirrors.xiaomo.site"]
+  "registry-mirrors": ["https://mirrors.example.com"]
 }</pre>
 <p>重启 Docker 后执行 <code>docker pull nginx</code>。</p>
 <h3>需要账号认证时</h3>
 <p><code>registry-mirrors</code> 不支持 URL 账号密码。移除无效 mirror 条目，保留其他配置；重启后登录 CRM：</p>
 <pre>sudo systemctl restart docker
-docker login mirrors.xiaomo.site --username admin
-docker pull mirrors.xiaomo.site/library/tomcat:latest</pre>
+docker login mirrors.example.com --username admin
+docker pull mirrors.example.com/library/tomcat:latest</pre>
 <p>替换示例用户名，按提示输入密码；拉取时必须保留 CRM 域名前缀。</p>
 
 <h2>Containerd 镜像加速设置</h2>
@@ -878,12 +878,12 @@ docker pull mirrors.xiaomo.site/library/tomcat:latest</pre>
 <p>创建 <code>/etc/containerd/certs.d/docker.io/hosts.toml</code>：</p>
 <pre>server = "https://registry-1.docker.io"
 
-[host."https://mirrors.xiaomo.site"]
+[host."https://mirrors.example.com"]
   capabilities = ["pull", "resolve"]</pre>
 <p>使用可信的 HTTPS 入口。失败时回退 Docker Hub；禁止直连时，将 <code>server</code> 也设为 CRM 地址。</p>
 <p>GHCR / GCR：将目录名 <code>docker.io</code> 和 <code>server</code> 域名改为 <code>ghcr.io</code> / <code>gcr.io</code>，CRM host 不变。</p>
 <p>需要认证时，仅在 CRM host 下添加请求头（不支持 URL 账号密码）：</p>
-<pre>[host."https://mirrors.xiaomo.site".header]
+<pre>[host."https://mirrors.example.com".header]
   Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
 <p>将不带换行的“用户名:密码”编码为单行 Base64，填入占位符。必须使用 HTTPS，并限制 <code>hosts.toml</code> 仅服务账号可读。</p>
 <p>修改 <code>config.toml</code> 后重启并验证；仅改 <code>hosts.toml</code> 无需重启：</p>
@@ -897,13 +897,13 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
 
 <h2>可选：前向代理</h2>
 <p>需将服务端 <code>listen</code> 设为 TCP 地址（如 <code>:8888</code>）；Unix socket 模式不可用。</p>
-<pre>curl -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/</pre>
+<pre>curl -x http://mirrors.example.com:8888 https://registry-1.docker.io/v2/</pre>
 <p>curl 认证：增加 <code>--proxy-user 用户名</code>，按提示输入密码。</p>
 <p>Docker：合并到 <code>/etc/docker/daemon.json</code> 后重启：</p>
 <pre>{
   "proxies": {
-    "http-proxy": "http://proxy.example.com:8888",
-    "https-proxy": "http://proxy.example.com:8888"
+    "http-proxy": "http://mirrors.example.com:8888",
+    "https-proxy": "http://mirrors.example.com:8888"
   }
 }</pre>
 <p>Containerd：在 systemd 服务配置中设置 <code>HTTP_PROXY</code> 和 <code>HTTPS_PROXY</code> 后重启。</p>

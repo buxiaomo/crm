@@ -2,7 +2,7 @@
 
 ## 目标与范围
 
-用户保留 `{"registry-mirrors":["https://mirrors.xiaomo.site"]}`，直接执行 `docker pull nginx`；客户端不需要 HTTP_PROXY/HTTPS_PROXY。本次支持 Docker Hub 公开镜像的只读拉取，不增加磁盘缓存、私仓凭证、多仓库路由或第三方依赖。现有前向代理保留兼容。
+用户保留 `{"registry-mirrors":["https://mirrors.example.com"]}`，直接执行 `docker pull nginx`；客户端不需要 HTTP_PROXY/HTTPS_PROXY。本次支持 Docker Hub 公开镜像的只读拉取，不增加磁盘缓存、私仓凭证、多仓库路由或第三方依赖。现有前向代理保留兼容。
 
 ## 已确认的问题
 
