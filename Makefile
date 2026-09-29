@@ -5,6 +5,6 @@ build:
 install:
 	@install -D -m 755 crm /usr/local/bin/crm
 	@install -D -m 644 crm.service /etc/systemd/system/crm.service
-	@install -D -m 600 config.yaml /usr/local/etc/crm.yaml
+	@install -D -m 600 config.example.yaml /usr/local/etc/crm.yaml
 	@systemctl enable crm
 	@systemctl restart crm

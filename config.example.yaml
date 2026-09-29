@@ -1,0 +1,39 @@
+domain: "mirrors.example.com"
+
+# 端口或 TCP 地址（如 "8888"、":8888"），或 Unix socket 绝对路径；只监听一个入口。
+listen: "/run/crm.sock"
+
+# 可选：取消注释并替换强密码后，全部入口要求 CRM 本地 Basic 认证。
+# 省略 auth 保持匿名；配置了 auth 但 users 为空则拒绝启动。
+# 配置含密码时请限制为服务账号可读（例如 chmod 600）。
+# auth:
+#   users:
+#     admin: "REPLACE_WITH_A_STRONG_PASSWORD"
+
+allowed_hosts:
+  - "docker.io"
+  - "registry-1.docker.io"
+  - "registry.k8s.io"
+  - "docker.elastic.co"
+  - "ghcr.io"
+  - "mcr.microsoft.com"
+  - "nvcr.io"
+  - "quay.io"
+  - "^.*\\.pkg\\.dev$"
+  - "^.*\\.k8s\\.io$"
+  - "^.*\\.gcr\\.io$"
+
+mitm:
+  enabled: false
+  ca_cert_path: "./ca.crt"
+  ca_key_path: "./ca.key"
+
+insecure_tls: false
+log_level: info
+
+# 安全配置 - 支持大文件下载
+security:
+  max_request_size: 10737418240    # 10GB (10 * 1024 * 1024 * 1024)
+  max_header_size: 1048576         # 1MB (1024 * 1024)
+  request_timeout: "30m"           # 30分钟
+  max_concurrent_reqs: 1000        # 最大并发请求数
