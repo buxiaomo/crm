@@ -807,7 +807,7 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 .auth-notice{padding:12px 16px;background:#fff8e1;border:1px solid #e6bd61;border-radius:6px}
 </style></head><body>
 <h1>Container Registry Mirrors</h1>
-<p class="muted">公开镜像加速器：Docker Hub 与 Containerd 白名单内多仓库拉取，服务端完成认证和下载，无磁盘缓存。</p>`)
+<p class="muted">仅加速公开镜像，不支持私有仓库或推送。请将示例域名替换为实际地址。</p>`)
 	if p.auth != nil {
 		fmt.Fprint(w, `<p class="auth-notice"><strong>已开启认证</strong>：未授权无法使用镜像加速，请先配置客户端认证。</p>`)
 	} else {
@@ -832,110 +832,67 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 	}
 	fmt.Fprint(w, `</ul>
 
-<h2>Docker 镜像加速</h2>
-<p>本节仅支持 Docker Hub 公开镜像的只读拉取，仍受上游匿名额度限制；不支持私有仓库或镜像推送。</p>
+<h2>Docker 镜像加速设置</h2>
+<p>仅适用于 Docker Hub，受上游匿名额度限制。</p>
 <h3>匿名访问</h3>
-<p>Docker Engine 的 /etc/docker/daemon.json：</p>
+<p>未开启认证时，合并到 <code>/etc/docker/daemon.json</code>：</p>
 <pre>{
   "registry-mirrors": ["https://mirrors.xiaomo.site"]
 }</pre>
-<p>将域名替换为你的 HTTPS 入口，重启 Docker 后执行 docker pull nginx。无需配置客户端 HTTP 代理。</p>
+<p>重启 Docker 后执行 <code>docker pull nginx</code>。</p>
 <h3>需要账号认证时</h3>
-<p>Docker Engine 不允许在 <code>registry-mirrors</code> URL 中携带用户名和密码。配置 <code>https://用户名:密码@mirrors.xiaomo.site</code> 会被拒绝，报错 <code>username/password not allowed in URI</code>；URL 编码或 Base64 也无法绕过这项限制。</p>
-<p>从 /etc/docker/daemon.json 移除这条无效的 mirror 配置，保留其他配置，再重启 Docker。随后登录 CRM，并在镜像名称中显式指定 CRM 域名：</p>
+<p><code>registry-mirrors</code> 不支持 URL 账号密码。移除无效 mirror 条目，保留其他配置；重启后登录 CRM：</p>
 <pre>sudo systemctl restart docker
 docker login mirrors.xiaomo.site --username admin
 docker pull mirrors.xiaomo.site/library/tomcat:latest</pre>
-<p>将示例域名和用户名替换为实际值，登录时按提示输入 CRM 账号密码。拉取时必须保留 CRM 域名前缀；仅执行 docker login 不会让 <code>docker pull tomcat</code> 自动使用 CRM 凭据。</p>
-<p>如果需要保持原始镜像名称，使用下文的认证前向代理方式；registry-mirrors 配置无法直接提供这组 CRM Basic 凭据。</p>
+<p>替换示例用户名，按提示输入密码；拉取时必须保留 CRM 域名前缀。</p>
 
-<h2>Containerd 镜像加速</h2>
-<p>Kubernetes / CRI 客户端在 /etc/containerd/config.toml 中启用 hosts 配置目录。按现有配置版本合并以下片段，保留其余配置。</p>
-<p>Containerd 1.5+ 的 1.x 版本（配置版本 2）：</p>
+<h2>Containerd 镜像加速设置</h2>
+<p>在 <code>/etc/containerd/config.toml</code> 中按现有配置版本合并一组片段，保留其他配置；<code>version</code> 放在文件顶层。</p>
+<p>配置版本 2（Containerd 1.5+ 的 1.x，或沿用版本 2 的 2.x）：</p>
 <pre>version = 2
 
 [plugins."io.containerd.grpc.v1.cri".registry]
   config_path = "/etc/containerd/certs.d"</pre>
-<p>Containerd 2.x（配置版本 3）：</p>
+<p>配置版本 3（Containerd 2.x）：</p>
 <pre>version = 3
 
 [plugins."io.containerd.cri.v1.images".registry]
   config_path = "/etc/containerd/certs.d"</pre>
-<p>version 是文件顶层字段。Containerd 2.x 若仍使用配置版本 2，可沿用第一种插件路径；不要只改版本号而保留不匹配的插件配置。</p>
 <p>创建 <code>/etc/containerd/certs.d/docker.io/hosts.toml</code>：</p>
 <pre>server = "https://registry-1.docker.io"
 
 [host."https://mirrors.xiaomo.site"]
   capabilities = ["pull", "resolve"]</pre>
-<p>将域名替换为自己信任的 CRM 入口；resolve 允许其解析 tag 对应的 digest。加速器失败时会回退 Docker Hub；如需禁止直连回退，将 server 也改为 https://mirrors.xiaomo.site。</p>
-<p>GHCR 与 GCR 可共用相同的 CRM 入口，分别创建以下文件：</p>
-<p><code>/etc/containerd/certs.d/ghcr.io/hosts.toml</code>：</p>
-<pre>server = "https://ghcr.io"
-
-[host."https://mirrors.xiaomo.site"]
-  capabilities = ["pull", "resolve"]</pre>
-<p><code>/etc/containerd/certs.d/gcr.io/hosts.toml</code>：</p>
-<pre>server = "https://gcr.io"
-
-[host."https://mirrors.xiaomo.site"]
-  capabilities = ["pull", "resolve"]</pre>
-<p>如果 CRM 要求账号认证，在上述各仓库的 hosts.toml 中为 CRM host 添加以下请求头；Containerd 不会从 host URL 中读取用户名和密码：</p>
+<p>使用可信的 HTTPS 入口。失败时回退 Docker Hub；禁止直连时，将 <code>server</code> 也设为 CRM 地址。</p>
+<p>GHCR / GCR：将目录名 <code>docker.io</code> 和 <code>server</code> 域名改为 <code>ghcr.io</code> / <code>gcr.io</code>，CRM host 不变。</p>
+<p>需要认证时，仅在 CRM host 下添加请求头（不支持 URL 账号密码）：</p>
 <pre>[host."https://mirrors.xiaomo.site".header]
   Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
-<p>对不带换行的“用户名:密码”做 Base64 编码，将单行结果填入占位符。仅为 CRM host 配置此请求头，CRM 校验后不会将其转发到上游。Base64 不是加密，必须使用 HTTPS，并限制 hosts.toml 为服务账号可读。</p>
-<p>Containerd 自动通过 ns 参数选择原仓库；CRM 只允许白名单内仓库的 HTTPS 默认/443 端口。无 ns 时仍使用 Docker Hub。仅支持公开镜像，不转发客户端登录凭证。</p>
-<p>GHCR 下载域名 pkg-containers.githubusercontent.com 已内置。其他仓库的认证/CDN 域名需要在 allowed_hosts 中按实际情况放行；请使用精确域名或带边界的正则。</p>
-<p>修改 config.toml 后重启并通过 CRI 验证；仅修改 hosts.toml 无需重启：</p>
+<p>将不带换行的“用户名:密码”编码为单行 Base64，填入占位符。必须使用 HTTPS，并限制 <code>hosts.toml</code> 仅服务账号可读。</p>
+<p>修改 <code>config.toml</code> 后重启并验证；仅改 <code>hosts.toml</code> 无需重启：</p>
 <pre>sudo systemctl restart containerd
 sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
   --image-endpoint unix:///run/containerd/containerd.sock \
   pull docker.io/library/nginx:latest</pre>
-<p>单独使用 ctr 时须显式传入 hosts 目录，它不读取 CRI 插件的 mirror 配置：</p>
+<p>使用 <code>ctr</code> 时须指定 hosts 目录：</p>
 <pre>sudo ctr images pull --hosts-dir /etc/containerd/certs.d docker.io/library/nginx:latest</pre>
-<h3>Containerd 1.x 旧配置兼容</h3>
-<pre>version = 2
-[plugins]
-  [plugins."io.containerd.grpc.v1.cri"]
-    [plugins."io.containerd.grpc.v1.cri".registry]
-      [plugins."io.containerd.grpc.v1.cri".registry.mirrors]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."gcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."registry.k8s.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."docker.elastic.co"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."ghcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."k8s.gcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."mcr.microsoft.com"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."nvcr.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-        [plugins."io.containerd.grpc.v1.cri".registry.mirrors."quay.io"]
-          endpoint = [ "https://mirrors.xiaomo.site" ]
-</pre>
-<p>旧式 CRI 配置已弃用，不与非空 config_path 混用；新部署使用 hosts.toml。修改后重启并使用上面的 crictl 命令验证。</p>
-<p>以上配置支持 Docker Hub、GHCR 和 GCR 的公开镜像；标签必须存在且允许匿名拉取，上游权限、限流和网络错误仍会导致失败。</p>
+<p>其他仓库和旧版配置见 <a href="https://github.com/buxiaomo/crm/blob/main/README.md#containerd-镜像加速器">Containerd 配置说明</a>；旧式 mirrors 不与 <code>config_path</code> 混用。</p>
 
 <h2>可选：前向代理</h2>
-<p>前向代理需要将 listen 配置为 TCP 地址（例如 :8888）；Unix socket 模式不开放 TCP 端口。请将下例中的 proxy.example.com:8888 替换为实际代理地址。</p>
+<p>需将服务端 <code>listen</code> 设为 TCP 地址（如 <code>:8888</code>）；Unix socket 模式不可用。</p>
 <pre>curl -x http://proxy.example.com:8888 https://registry-1.docker.io/v2/</pre>
-<p>如需代理认证，curl 命令增加 <code>--proxy-user 用户名</code> 并按提示输入密码；凭据仅用于 CRM 认证。</p>
-<p>Docker Engine 的 /etc/docker/daemon.json：</p>
+<p>curl 认证：增加 <code>--proxy-user 用户名</code>，按提示输入密码。</p>
+<p>Docker：合并到 <code>/etc/docker/daemon.json</code> 后重启：</p>
 <pre>{
   "proxies": {
     "http-proxy": "http://proxy.example.com:8888",
     "https-proxy": "http://proxy.example.com:8888"
   }
 }</pre>
-<p>Containerd：在 containerd 服务的 systemd 配置中设置 HTTP_PROXY 和 HTTPS_PROXY，然后重启服务。</p>
-<p>allowed_hosts 同时用于前向代理与非 Hub mirror 的仓库、认证和下载主机；Docker Hub mirror 保持固定的认证和 CDN 范围。</p>
+<p>Containerd：在 systemd 服务配置中设置 <code>HTTP_PROXY</code> 和 <code>HTTPS_PROXY</code> 后重启。</p>
 
 <footer>
-若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。<br>
 项目地址：<a href="https://github.com/buxiaomo/crm.git" target="_blank">https://github.com/buxiaomo/crm.git</a>
 </footer>
 </body></html>`)
