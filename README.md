@@ -234,6 +234,11 @@ go build -o crm
 推荐使用 YAML：复制示例 `config.yaml` 并根据需要修改。程序会优先读取当前目录的 `config.yaml` / `config.yml`，其次读取 `config.json`；也可通过命令行 `-config` 指定路径。若未找到配置文件，程序会直接退出并提示错误。
 
 配置项说明：
+
+- `domain`: 首页 Docker、Containerd 和前向代理示例使用的 CRM 主机名；省略或空字符串时为 `mirrors.example.com`。
+  仅填写 ASCII 主机名，不带协议、端口、路径或末尾点；每段最多 63 字符，总长最多 253 字符，国际化域名请使用 Punycode。
+  域名须包含点号（`localhost` 除外），避免 Docker 将其解析为 Hub 命名空间。
+  只影响首页示例，不改变监听地址、上游或白名单。
 - `auth.users`: 可选的 CRM 本地账号密码映射；配置后镜像拉取和代理要求认证，首页与监控的普通 GET 请求公开，详见上文。
 - `listen`: 唯一监听入口。端口或 TCP 地址（如 `8888`、`:8888`、`127.0.0.1:8888`、`[::1]:8888`）使用 TCP；绝对路径（如 `/run/crm.sock`）使用 Unix socket。不能为空，不支持相对 socket 路径，不会同时开启两种入口。socket 目录须存在；启动时仅清理确认无监听进程的旧 socket，拒绝覆盖普通文件、符号链接或正在使用的 socket。同一路径只应由一个服务实例管理。
 - `allowed_hosts`: 在默认白名单基础上追加前向代理及非 Hub mirror 的仓库、认证和下载主机，支持正则表达式（不区分大小写）；Hub mirror 保留固定认证/CDN 范围。
@@ -263,6 +268,19 @@ listen: "/run/crm.sock"
 ```
 
 升级旧配置时，删除 `socket_path`。如果原先使用 socket，将其路径移到 `listen`；若保留 `listen: ":8888"`，则只启动 TCP，旧 `socket_path` 不再生效。
+
+### 修改首页域名
+
+在实际使用的配置文件中设置：
+
+```yaml
+domain: "mirrors.example.com"
+```
+
+替换为自己的 CRM 主机名后重启服务（systemd 部署使用 `sudo systemctl restart crm`），
+首页所有 CRM 地址即可更新，无需修改源码或重新编译。
+配置仅在启动时读取；不自动修改 DNS、证书、Caddy/Nginx 或客户端现有配置。
+首页 mirror 示例使用 HTTPS，前向代理示例仍使用 HTTP 和 `:8888`。
 
 ## 前向代理使用示例（兼容可选）
 
@@ -436,7 +454,7 @@ make build
 bash tests/e2e-listener.sh
 ```
 
-需要 Go、Bash 和 curl。脚本构建本机二进制，使用随机 TCP 端口和临时 Unix socket 验证单入口监听、健康检查、错误配置、活动 socket 保护和退出清理；无需 Docker 或外网。
+需要 Go、Bash 和 curl。脚本构建本机二进制，使用随机 TCP 端口和临时 Unix socket 验证单入口监听、健康检查、错误配置、活动 socket 保护和退出清理；还会在同一二进制下更改域名配置并重启，验证首页八处地址及请求 Host 隔离。无需 Docker 或外网。
 
 ### 隔离 Docker 拉取 E2E
 

@@ -61,6 +61,12 @@ for phase in tcp bare_port unix; do
   [[ "${phase}" != bare_port ]] || listen='0'
   [[ "${phase}" != unix ]] || listen="${tmp_dir}/crm.sock"
   printf 'listen: "%s"\n' "${listen}" >"${tmp_dir}/config.yaml"
+  domain='mirrors.example.com'
+  [[ "${phase}" != bare_port ]] || domain='mirror-a.example.com'
+  [[ "${phase}" != unix ]] || domain='mirror-b.example.com'
+  if [[ "${phase}" != tcp ]]; then
+    printf 'domain: "%s"\n' "${domain}" >>"${tmp_dir}/config.yaml"
+  fi
   log_file="${tmp_dir}/${phase}.log"
   "${tmp_dir}/crm" -config "${tmp_dir}/config.yaml" >"${log_file}" 2>&1 &
   server_pid=$!
@@ -83,6 +89,25 @@ for phase in tcp bare_port unix; do
     (( SECONDS < deadline )) || fail 'Health check did not pass in 10s.'
     sleep 0.1
   done
+  curl -q --noproxy '*' --fail --silent --show-error --max-time 5 \
+    "${curl_args[@]%/healthz}" --header 'Host: request.invalid' \
+    --header 'X-Forwarded-Host: forwarded.invalid' \
+    >"${tmp_dir}/index.html" || fail 'Index request failed.'
+  for example in \
+    "\"registry-mirrors\": [\"https://${domain}\"]" \
+    "docker login ${domain} --username admin" \
+    "docker pull ${domain}/library/tomcat:latest" \
+    "[host.\"https://${domain}\"]" \
+    "[host.\"https://${domain}\".header]" \
+    "curl -x http://${domain}:8888 https://registry-1.docker.io/v2/" \
+    "\"http-proxy\": \"http://${domain}:8888\"" \
+    "\"https-proxy\": \"http://${domain}:8888\""; do
+    grep -Fq "${example}" "${tmp_dir}/index.html" ||
+      fail "Index did not use configured domain: ${example}"
+  done
+  if grep -Eq 'request\.invalid|forwarded\.invalid' "${tmp_dir}/index.html"; then
+    fail 'Request host changed the index examples.'
+  fi
   [[ "$(grep -c '正在监听' "${log_file}")" == 1 ]] ||
     fail 'Expected exactly one successful listener log.'
   if [[ "${phase}" == unix ]]; then
@@ -112,12 +137,16 @@ for phase in tcp bare_port unix; do
   [[ ! -e "${tmp_dir}/crm.sock" ]] || fail 'Socket remained after shutdown.'
 done
 
-for phase in empty invalid_tcp missing_directory; do
+for phase in empty invalid_tcp missing_directory invalid_domain; do
   listen=''
+  [[ "${phase}" != invalid_domain ]] || listen='127.0.0.1:0'
   [[ "${phase}" != invalid_tcp ]] || listen='localhost'
   [[ "${phase}" != missing_directory ]] ||
     listen="${tmp_dir}/missing/crm.sock"
   printf 'listen: "%s"\n' "${listen}" >"${tmp_dir}/config.yaml"
+  if [[ "${phase}" == invalid_domain ]]; then
+    printf 'domain: "https://mirror.example.com"\n' >>"${tmp_dir}/config.yaml"
+  fi
   log_file="${tmp_dir}/${phase}.log"
   "${tmp_dir}/crm" -config "${tmp_dir}/config.yaml" >"${log_file}" 2>&1 &
   child_pid=$!
@@ -130,4 +159,4 @@ for phase in empty invalid_tcp missing_directory; do
   [[ ! -e "${tmp_dir}/crm.sock" && ! -e "${tmp_dir}/missing/crm.sock" ]] ||
     fail 'Invalid configuration created a socket.'
 done
-echo 'PASS: TCP, bare port, Unix socket, invalid config, bind failure and shutdown.'
+echo 'PASS: listeners, configured index domains after restart, invalid config, bind failure and shutdown.'

@@ -7,6 +7,7 @@ import (
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -597,5 +598,127 @@ func TestAuthCredentialsNotLogged(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "Status=200") {
 		t.Error("request status missing from logs")
+	}
+}
+
+func TestDomainConfigValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, domain string
+		valid        bool
+	}{
+		{"empty", "", true},
+		{"hostname", "mirrors.example.com", true},
+		{"uppercase", "Mirror-A.Example.COM", true},
+		{"local", "localhost", true},
+		{"local_uppercase", "LOCALHOST", true},
+		{"single_label", "crm", false},
+		{"single_label_uppercase", "CRM", false},
+		{"punycode", "xn--fsqu00a.example", true},
+		{"label_limit", strings.Repeat("a", 63) + ".example", true},
+		{"domain_limit", strings.Repeat("a.", 126) + "a", true},
+		{"scheme", "https://mirrors.example.com", false},
+		{"port", "mirrors.example.com:8443", false},
+		{"path", "mirrors.example.com/v2", false},
+		{"credentials", "user@mirrors.example.com", false},
+		{"query", "mirrors.example.com?x=1", false},
+		{"fragment", "mirrors.example.com#x", false},
+		{"whitespace", " mirrors.example.com ", false},
+		{"newline", "mirror\n.example.com", false},
+		{"empty_label", "mirrors..example.com", false},
+		{"leading_hyphen", "-mirrors.example.com", false},
+		{"trailing_hyphen", "mirrors-.example.com", false},
+		{"trailing_dot", "mirrors.example.com.", false},
+		{"html", `mirror<script>.example.com`, false},
+		{"shell", `mirror$(id).example.com`, false},
+		{"unicode", "镜像.example.com", false},
+		{"label_too_long", strings.Repeat("a", 64) + ".example", false},
+		{"domain_too_long", strings.Repeat("a.", 126) + "aa", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := json.Marshal(map[string]string{"listen": ":8888", "domain": tc.domain})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var cfg Config
+			if err := json.Unmarshal(body, &cfg); err != nil {
+				t.Fatal(err)
+			}
+			err = cfg.Validate()
+			if (err == nil) != tc.valid {
+				t.Fatalf("Validate() error=%v, valid=%t", err, tc.valid)
+			}
+			if err != nil && !strings.Contains(err.Error(), "domain") {
+				t.Errorf("error does not identify domain: %v", err)
+			}
+		})
+	}
+}
+
+func TestIndexConfiguredDomain(t *testing.T) {
+	for _, tc := range []struct {
+		name, ext, config, want string
+	}{
+		{"default", "yaml", "listen: ':8888'\n", "mirrors.example.com"},
+		{"empty", "yaml", "listen: ':8888'\ndomain: ''\n", "mirrors.example.com"},
+		{"yaml", "yaml", "listen: ':8888'\ndomain: mirror-a.example.com\n", "mirror-a.example.com"},
+		{"yml", "yml", "listen: ':8888'\ndomain: mirror-b.example.com\n", "mirror-b.example.com"},
+		{"json_auth", "json", `{"listen":":8888","domain":"mirror-c.example.com","auth":{"users":{"user":"secret"}}}`, "mirror-c.example.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config."+tc.ext)
+			if err := os.WriteFile(path, []byte(tc.config), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := loadConfigFrom(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			base := testProxyHandler(t)
+			p := newProxyHandler(base.allowedPatterns, false, 0, cfg)
+			t.Cleanup(p.transport.CloseIdleConnections)
+			previous := ""
+			for _, host := range []string{"request-a.invalid", "request-b.invalid"} {
+				req := httptest.NewRequest(http.MethodGet, "/", nil)
+				req.Host = host
+				req.Header.Set("X-Forwarded-Host", host)
+				req.Header.Set("Forwarded", "host="+host)
+				page := httptest.NewRecorder()
+				p.ServeHTTP(page, req)
+				body := page.Body.String()
+				if page.Code != http.StatusOK {
+					t.Fatalf("index status=%d", page.Code)
+				}
+				for _, format := range []string{
+					`"registry-mirrors": ["https://%s"]`,
+					`docker login %s --username admin`,
+					`docker pull %s/library/tomcat:latest`,
+					`[host."https://%s"]`,
+					`[host."https://%s".header]`,
+					`curl -x http://%s:8888 https://registry-1.docker.io/v2/`,
+					`"http-proxy": "http://%s:8888"`,
+					`"https-proxy": "http://%s:8888"`,
+				} {
+					want := fmt.Sprintf(format, tc.want)
+					if !strings.Contains(body, want) {
+						t.Errorf("index missing %q", want)
+					}
+				}
+				for _, want := range []string{`server = "https://registry-1.docker.io"`, `<li>docker.io</li>`, `https://github.com/buxiaomo/crm.git`} {
+					if !strings.Contains(body, want) {
+						t.Errorf("index lost %q", want)
+					}
+				}
+				if tc.want != "mirrors.example.com" && strings.Contains(body, "mirrors.example.com") {
+					t.Error("index still contains default domain")
+				}
+				if strings.Contains(body, host) || (previous != "" && body != previous) {
+					t.Error("request host changed index content")
+				}
+				previous = body
+			}
+		})
 	}
 }

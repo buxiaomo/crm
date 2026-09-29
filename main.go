@@ -94,6 +94,7 @@ var defaultAllowedHosts = []string{
 type Config struct {
 	Auth         *AuthConfig    `yaml:"auth" json:"auth"`
 	Listen       string         `yaml:"listen" json:"listen"`
+	Domain       string         `yaml:"domain" json:"domain"`
 	AllowedHosts []string       `yaml:"allowed_hosts" json:"allowed_hosts"`
 	InsecureTLS  bool           `yaml:"insecure_tls" json:"insecure_tls"`
 	LogLevel     string         `yaml:"log_level" json:"log_level"`
@@ -113,6 +114,16 @@ type SecurityConfig struct {
 func (c *Config) Validate() error {
 	if err := c.Auth.Validate(); err != nil {
 		return err
+	}
+	if c.Domain != "" {
+		// Docker treats other single-label names as Hub namespaces.
+		if !strings.Contains(c.Domain, ".") && !strings.EqualFold(c.Domain, "localhost") {
+			return fmt.Errorf("domain must contain a dot or be localhost")
+		}
+		const label = `[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?`
+		if len(c.Domain) > 253 || !regexp.MustCompile(`^`+label+`(?:\.`+label+`)*$`).MatchString(c.Domain) {
+			return fmt.Errorf("domain must be an ASCII hostname without scheme, port or path (max 253 characters)")
+		}
 	}
 	if c.Listen == "" {
 		return fmt.Errorf("listen address cannot be empty")
@@ -435,6 +446,7 @@ func (ca *CertificateAuthority) GetCertificate(hostname string) (*tls.Certificat
 // ProxyHandler implements a simple forward proxy without caching.
 type ProxyHandler struct {
 	auth            *AuthConfig
+	domain          string
 	allowedPatterns []*regexp.Regexp
 	allowedDisplay  []string
 	transport       *http.Transport
@@ -463,6 +475,7 @@ func newProxyHandler(allowed []*regexp.Regexp, insecureTLS bool, level LogLevel,
 	}
 
 	handler := &ProxyHandler{
+		domain:          "mirrors.example.com",
 		allowedPatterns: allowed,
 		allowedDisplay:  append([]string(nil), defaultAllowedHosts...),
 		transport:       tr,
@@ -472,6 +485,9 @@ func newProxyHandler(allowed []*regexp.Regexp, insecureTLS bool, level LogLevel,
 
 	if cfg != nil {
 		handler.auth = cfg.Auth
+		if cfg.Domain != "" {
+			handler.domain = cfg.Domain
+		}
 		handler.allowedDisplay = append(handler.allowedDisplay, cfg.AllowedHosts...)
 	}
 
@@ -817,7 +833,7 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 .auth-open { background: #f0fdf4; border-color: #15803d; color: #14532d; }
 </style></head><body>
 <h1>Container Registry Mirrors</h1>
-<p class="muted">仅加速公开镜像，不支持私有仓库或推送。请将示例域名替换为实际地址。</p>`)
+<p class="muted">仅加速公开镜像，不支持私有仓库或推送。以下示例使用服务端配置的 CRM 域名。</p>`)
 	if p.auth != nil {
 		fmt.Fprint(w, `<aside class="auth-notice auth-required" aria-label="认证状态">
 <strong>已开启认证 · 需要账号密码</strong>
@@ -846,21 +862,21 @@ ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 		shown[key] = struct{}{}
 		fmt.Fprintf(w, "<li>%s</li>\n", html.EscapeString(host))
 	}
-	fmt.Fprint(w, `</ul>
+	fmt.Fprintf(w, `</ul>
 
 <h2>Docker 镜像加速设置</h2>
 <p>仅适用于 Docker Hub，受上游匿名额度限制。</p>
 <h3>匿名访问</h3>
 <p>未开启认证时，合并到 <code>/etc/docker/daemon.json</code>：</p>
 <pre>{
-  "registry-mirrors": ["https://mirrors.example.com"]
+  "registry-mirrors": ["https://%[1]s"]
 }</pre>
 <p>重启 Docker 后执行 <code>docker pull nginx</code>。</p>
 <h3>需要账号认证时</h3>
 <p><code>registry-mirrors</code> 不支持 URL 账号密码。移除无效 mirror 条目，保留其他配置；重启后登录 CRM：</p>
 <pre>sudo systemctl restart docker
-docker login mirrors.example.com --username admin
-docker pull mirrors.example.com/library/tomcat:latest</pre>
+docker login %[1]s --username admin
+docker pull %[1]s/library/tomcat:latest</pre>
 <p>替换示例用户名，按提示输入密码；拉取时必须保留 CRM 域名前缀。</p>
 
 <h2>Containerd 镜像加速设置</h2>
@@ -878,12 +894,12 @@ docker pull mirrors.example.com/library/tomcat:latest</pre>
 <p>创建 <code>/etc/containerd/certs.d/docker.io/hosts.toml</code>：</p>
 <pre>server = "https://registry-1.docker.io"
 
-[host."https://mirrors.example.com"]
+[host."https://%[1]s"]
   capabilities = ["pull", "resolve"]</pre>
 <p>使用可信的 HTTPS 入口。失败时回退 Docker Hub；禁止直连时，将 <code>server</code> 也设为 CRM 地址。</p>
 <p>GHCR / GCR：将目录名 <code>docker.io</code> 和 <code>server</code> 域名改为 <code>ghcr.io</code> / <code>gcr.io</code>，CRM host 不变。</p>
 <p>需要认证时，仅在 CRM host 下添加请求头（不支持 URL 账号密码）：</p>
-<pre>[host."https://mirrors.example.com".header]
+<pre>[host."https://%[1]s".header]
   Authorization = "Basic BASE64_OF_USERNAME_COLON_PASSWORD"</pre>
 <p>将不带换行的“用户名:密码”编码为单行 Base64，填入占位符。必须使用 HTTPS，并限制 <code>hosts.toml</code> 仅服务账号可读。</p>
 <p>修改 <code>config.toml</code> 后重启并验证；仅改 <code>hosts.toml</code> 无需重启：</p>
@@ -897,13 +913,13 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
 
 <h2>可选：前向代理</h2>
 <p>需将服务端 <code>listen</code> 设为 TCP 地址（如 <code>:8888</code>）；Unix socket 模式不可用。</p>
-<pre>curl -x http://mirrors.example.com:8888 https://registry-1.docker.io/v2/</pre>
+<pre>curl -x http://%[1]s:8888 https://registry-1.docker.io/v2/</pre>
 <p>curl 认证：增加 <code>--proxy-user 用户名</code>，按提示输入密码。</p>
 <p>Docker：合并到 <code>/etc/docker/daemon.json</code> 后重启：</p>
 <pre>{
   "proxies": {
-    "http-proxy": "http://mirrors.example.com:8888",
-    "https-proxy": "http://mirrors.example.com:8888"
+    "http-proxy": "http://%[1]s:8888",
+    "https-proxy": "http://%[1]s:8888"
   }
 }</pre>
 <p>Containerd：在 systemd 服务配置中设置 <code>HTTP_PROXY</code> 和 <code>HTTPS_PROXY</code> 后重启。</p>
@@ -912,7 +928,7 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
 若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。<br>
 项目地址：<a href="https://github.com/buxiaomo/crm.git" target="_blank">https://github.com/buxiaomo/crm.git</a>
 </footer>
-</body></html>`)
+</body></html>`, html.EscapeString(p.domain))
 }
 
 // bufferedConn preserves bytes read ahead while parsing CONNECT.
