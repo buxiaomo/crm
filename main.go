@@ -804,14 +804,30 @@ func (p *ProxyHandler) serveIndex(w http.ResponseWriter, r *http.Request) {
 h1{font-size:22px;margin:0 0 12px}h2{font-size:18px;margin:24px 0 8px}code,pre{background:#f6f8fa;border:1px solid #e1e4e8;border-radius:6px;padding:2px 6px}
 ul{padding-left:20px}footer{margin-top:32px;color:#666;font-size:12px}
 .muted{color:#666;font-size:13px}
-.auth-notice{padding:12px 16px;background:#fff8e1;border:1px solid #e6bd61;border-radius:6px}
+.auth-notice {
+  border: 2px solid;
+  border-left-width: 6px;
+  border-radius: 8px;
+  margin: 20px 0;
+  padding: 18px 20px;
+}
+.auth-notice strong { display: block; font-size: 20px; line-height: 1.4; }
+.auth-notice p { margin: 8px 0 0; line-height: 1.6; }
+.auth-required { background: #fff1f2; border-color: #be123c; color: #881337; }
+.auth-open { background: #f0fdf4; border-color: #15803d; color: #14532d; }
 </style></head><body>
 <h1>Container Registry Mirrors</h1>
 <p class="muted">仅加速公开镜像，不支持私有仓库或推送。请将示例域名替换为实际地址。</p>`)
 	if p.auth != nil {
-		fmt.Fprint(w, `<p class="auth-notice"><strong>已开启认证</strong>：未授权无法使用镜像加速，请先配置客户端认证。</p>`)
+		fmt.Fprint(w, `<aside class="auth-notice auth-required" aria-label="认证状态">
+<strong>已开启认证 · 需要账号密码</strong>
+<p>未授权无法使用镜像加速，请先配置客户端认证。</p>
+</aside>`)
 	} else {
-		fmt.Fprint(w, `<p class="muted">未开启认证：镜像加速允许匿名访问。</p>`)
+		fmt.Fprint(w, `<aside class="auth-notice auth-open" aria-label="认证状态">
+<strong>未开启认证：镜像加速允许匿名访问。</strong>
+<p>无需账号密码，按下方配置即可使用。</p>
+</aside>`)
 	}
 	fmt.Fprint(w, `
 
@@ -893,6 +909,7 @@ sudo crictl --runtime-endpoint unix:///run/containerd/containerd.sock \
 <p>Containerd：在 systemd 服务配置中设置 <code>HTTP_PROXY</code> 和 <code>HTTPS_PROXY</code> 后重启。</p>
 
 <footer>
+若需在 HTTPS 下查看详细请求信息，请启用调试用 MITM 模式（默认未开启）。<br>
 项目地址：<a href="https://github.com/buxiaomo/crm.git" target="_blank">https://github.com/buxiaomo/crm.git</a>
 </footer>
 </body></html>`)
