@@ -206,7 +206,7 @@ version = 2
 
 支持通过命令行指定配置文件路径，或在当前目录自动发现。
 
-1) 在工作目录准备 `config.yaml`（或 `config.yml` / 兼容 `config.json`）。
+1) 执行 `cp config.example.yaml config.yaml` 创建本地配置并按需修改（也支持 `config.yml` / 兼容 `config.json`）。
 2) 启动服务：
 
 ```bash
@@ -231,7 +231,7 @@ go build -o crm
 
 ## 配置文件
 
-推荐使用 YAML：复制示例 `config.yaml` 并根据需要修改。程序会优先读取当前目录的 `config.yaml` / `config.yml`，其次读取 `config.json`；也可通过命令行 `-config` 指定路径。若未找到配置文件，程序会直接退出并提示错误。
+推荐使用 YAML：复制示例 `config.example.yaml` 为本地 `config.yaml` 并根据需要修改。本地 `config.yaml` 已被 Git 忽略，不应提交。程序会优先读取当前目录的 `config.yaml` / `config.yml`，其次读取 `config.json`；也可通过命令行 `-config` 指定路径。若未找到配置文件，程序会直接退出并提示错误。
 
 配置项说明：
 
@@ -340,7 +340,7 @@ sudo systemctl restart containerd
 
 拉取镜像会访问认证服务器及下载重定向地址。这些地址也必须在 `allowed_hosts` 中；按实际仓库添加精确域名或带边界的正则，避免使用无限制通配。Docker 的相关域名可参考[官方白名单](https://docs.docker.com/desktop/setup/allow-list/)。
 
-仓库中的 `Caddy` 和 `nginx.conf` 提供 mirror API、首页、健康检查和指标入口；`registry-mirrors` 指向该 HTTPS 域名。示例与 `config.yaml` 统一使用 `/run/crm.sock`，目录须存在且服务用户可写，反向代理用户须能访问 socket。nginx 示例关闭响应缓冲，避免镜像层写入临时文件。
+仓库中的 `Caddy` 和 `nginx.conf` 提供 mirror API、首页、健康检查和指标入口；`registry-mirrors` 指向该 HTTPS 域名。示例与 `config.example.yaml` 统一使用 `/run/crm.sock`，目录须存在且服务用户可写，反向代理用户须能访问 socket。nginx 示例关闭响应缓冲，避免镜像层写入临时文件。
 
 这些普通反向代理配置不提供 CONNECT 隧道。socket 模式不开放 TCP 端口；需要前向代理时，将 `listen` 改为 TCP 地址，并将 Caddy 的 `reverse_proxy` 或 nginx 的 `upstream` 地址改为 `127.0.0.1:8888`（端口与 CRM 配置保持一致），客户端再连接 CRM 的端口。
 
